@@ -1,4 +1,4 @@
-# netexec-automator-on-crack
+# TomSploit — AD Enumeration Made Easy
 Automates NetExec across all protocols and auth methods, summarises results, and suggests follow-up commands based on what succeeded.
 
 # set up
