@@ -7,4 +7,4 @@ Download the .py
 
 chmod +x /path/to/TomSploit.py
 
-sudo cp /path/to/netexec-automator.py /usr/local/bin/TomSploit
+sudo cp /path/to/TomSploit.py /usr/local/bin/TomSploit
