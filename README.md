@@ -3,7 +3,7 @@ Automates NetExec across all protocols and auth methods, summarises results, and
 
 # Set up
 
-Download the .py 
+git clone https://github.com/twhitehead290/TomSploit.git 
 
 chmod +x /path/to/TomSploit.py
 
