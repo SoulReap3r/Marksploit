@@ -10,5 +10,7 @@ chmod +x /path/to/TomSploit.py
 sudo cp /path/to/TomSploit.py /usr/local/bin/TomSploit
 
 # Usage
+
 netexec-automator -t TARGET -u USER -p PASSWORD
+
 netexec-automator -t live_hosts.txt -u USER -p PASSWORD
