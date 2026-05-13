@@ -1,4 +1,4 @@
-# TomSploit — AD Enumeration Made Easy
+# TomSploit — AD Enumeration
 Automates NetExec across all protocols and auth methods, summarises results, and suggests follow-up commands based on what succeeded.
 
 # Set up
