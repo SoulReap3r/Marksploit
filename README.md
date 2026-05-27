@@ -6,9 +6,9 @@ tomsploit removes that friction. When a credential works, it prints follow-up co
 
 Demo
 text
-════════════════════════════════════════════════════════════
+
   ⚡ tomsploit
-════════════════════════════════════════════════════════════
+
 
   Targets         │ 1           Protocols │ all
   Users           │ 1           Workers   │ 15
@@ -16,13 +16,13 @@ text
   Log file        │ 2026-05-27_15-30-00.txt
   Total attempts  │ 15
   
-════════════════════════════════════════════════════════════
+
 
   ► 172.16.1.20
 
-────────────────────────────────────────────────────────────
+
   📋 Results (172.16.1.20) [DC] [3.4s]
-────────────────────────────────────────────────────────────
+
     Windows Server 2019 (name:DC01) (domain:corp.local)
 
   ✔ SMB (domain)         DC01 corp.local\admin:Password123! (Pwn3d!)
