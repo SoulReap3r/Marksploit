@@ -1,13 +1,13 @@
 A NetExec orchestrator built around the OSCP enumeration workflow: test one credential set against every relevant protocol on every host, and when something works, print the exact commands you'd normally tab back to your notes for.
 
 Why
+
 You're a few hours into an exam machine. You spray creds, SMB lights up green, and now you're googling "impacket secretsdump just-dc syntax" again. Or "evil-winrm hash flag". Or "xfreerdp pass the hash."
 tomsploit removes that friction. When a credential works, it prints follow-up commands with your username, password, hash, IP, and domain already filled in — copy, paste, run.
 
-Demo
-text
+Demo 
 
-  ⚡ tomsploit
+⚡ tomsploit
 
 
   Targets         │ 1           Protocols │ all
@@ -29,7 +29,8 @@ text
   ✔ LDAP (domain)        DC01 corp.local\admin:Password123!
   ✔ WMI (domain)         DC01 corp.local\admin:Password123! (Pwn3d!)
   ✔ WINRM (domain)       DC01 corp.local\admin:Password123! (Pwn3d!)
-────────────────────────────────────────────────────────────
+
+
 
   ✓ VALID CREDENTIALS
 
@@ -39,7 +40,7 @@ text
     ► WINRM (domain)      │ corp.local\admin:Password123! (Pwn3d!) [admin]
 
   💡 Suggested Commands [DC]
-  ──────────────────────────────────────────────────────────
+
 
     ► [SMB]
         # crackmapexec --shares
