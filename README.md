@@ -81,7 +81,7 @@ Demo
 
 
   Domain Controllers detected
-─
+
     ► DC01 (172.16.1.20) — corp.local
 
   No-auth AD attacks (try alongside any creds found above)
@@ -107,8 +107,10 @@ Demo
 Features
 
 10 protocols sprayed in parallel: SMB, LDAP, WinRM, WMI, RDP, MSSQL, SSH, FTP, VNC, NFS
-Password, hash (NTLM), and Kerberos authentication — auto-filtered per protocol so hashes never hit SSH
-DC detection drives smarter follow-ups: secretsdump -just-dc over a DC instead of the full SAM/LSA/NTDS chain that hangs on RemoteRegistry
+Password, hash (NTLM), and Kerberos authentication 
+— auto-filtered per protocol so hashes never hit SSH
+DC detection drives smarter follow-ups: 
+secretsdump -just-dc over a DC instead of the full SAM/LSA/NTDS chain that hangs on RemoteRegistry
 CIDR expansion with a configurable per-block host cap
 Pre-flight port probe skips closed ports so a /24 scan finishes in minutes
 Anonymous SMB detection with its own follow-up command set
