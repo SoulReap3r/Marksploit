@@ -77,6 +77,7 @@ PROTOCOL_PORTS = {
 }
 
 DEFAULT_WORKERS          = 15
+DEFAULT_TARGET_WORKERS   = 3
 NETEXEC_TIMEOUT          = 30
 SUBPROCESS_TIMEOUT       = 45
 PORT_PROBE_TIMEOUT       = 2.0
@@ -197,9 +198,26 @@ def looks_like_dc(info: str) -> bool:
     if not m: return False
     return bool(re.search(r"\bdc\d*\b|^dc|pdc|addc", m.group(1).lower()))
 
+def extract_ssh_hostname(info: str) -> str:
+    """Extract hostname from SSH banners if possible."""
+    patterns = [
+        r"name:([^\s)]+)",
+        r"hostname[:=]\s*([^\s]+)",
+        r"server[:=]\s*([^\s]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, info, re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
+    return ""
+
 def extract_hostname(info: str) -> str:
+    if not info:
+        return ""
     m = re.search(r"name:([^\s)]+)", info, re.IGNORECASE)
-    return m.group(1).upper() if m else ""
+    if m:
+        return m.group(1).upper()
+    return extract_ssh_hostname(info)
 
 def extract_domain(info: str) -> str:
     m = re.search(r"domain:([^\s)]+)", info, re.IGNORECASE)
@@ -407,17 +425,19 @@ def print_suggested_commands(result: TargetResult, extra_hash: str|None) -> None
 def print_target_block(result: TargetResult, extra_hash: str|None,
                        verbose: bool) -> None:
     ip   = result.real_ip or result.target
-    host = result.hostname or ""
+    host = result.hostname or result.target
 
     has_hits   = bool(result.successes or result.guests or result.anon_smb)
     has_errors = any(m == "[!]"
                      for lines in result.protocol_lines.values()
                      for m, _ in lines)
-    if not has_hits and not has_errors and not verbose:
+    has_info = any(m == "[*]"
+                   for lines in result.protocol_lines.values()
+                   for m, _ in lines)
+    if not has_hits and not has_errors and not has_info and not verbose:
         return
 
-    print(flush=True)
-    print(_SEP, flush=True)
+    print(f"\n\n{_SEP}", flush=True)
     print(flush=True)
 
     if result.target_info:
@@ -439,7 +459,7 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
         try: return (ALL_PROTOCOLS.index(s.protocol), int(s.local_auth))
         except ValueError: return (len(ALL_PROTOCOLS), int(s.local_auth))
 
-    all_hits = sorted(result.successes + result.guests, key=sort_key)
+    all_hits = sorted(result.successes, key=sort_key)
     if all_hits:
         for s in all_hits:
             scope = "local" if s.local_auth else "domain"
@@ -451,6 +471,7 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
             iprint("[+]", f"{s.raw_message}   [{tag}]{qual}")
         print(flush=True)
 
+    seen_info: set[tuple[str, str]] = set()
     for proto in ALL_PROTOCOLS:
         for scope in (False, True):
             key   = f"{proto}-{'local' if scope else 'domain'}"
@@ -460,6 +481,12 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
             for marker, msg in lines:
                 if marker == "[!]":               iprint("[!]", msg + sn)
                 elif marker == "[-]" and verbose: iprint("[-]", msg + sn)
+                elif marker == "[*]":
+                    info_key = (proto, msg)
+                    if info_key in seen_info:
+                        continue
+                    seen_info.add(info_key)
+                    iprint("[*]", f"{proto.upper()} {msg}" + sn)
 
     if result.anon_smb:
         iprint("[*]", "anonymous SMB — next steps")
@@ -583,7 +610,7 @@ def append_creds(path: str, result: TargetResult) -> None:
 class MarkSploit:
     def __init__(self, *, targets, users, passwords, hashes, kerberos,
                  protocols, log_file, creds_file, json_out, save_file, script_file,
-                 workers, quiet, verbose, debug, no_port_probe, extra_hash,
+                 workers, target_workers, quiet, verbose, debug, no_port_probe, extra_hash,
                  spray, spray_delay, auto_enum, timeout_skip):
         self.targets      = targets
         self.users        = users
@@ -597,6 +624,7 @@ class MarkSploit:
         self.save_file    = save_file
         self.script_file  = script_file
         self.workers      = workers
+        self.target_workers = max(1, target_workers)
         self.quiet        = quiet
         self.verbose      = verbose
         self.debug        = debug
@@ -617,6 +645,8 @@ class MarkSploit:
         self._progress_lock = threading.Lock()
         self._done = self._total = self._scan_done = 0
         self._scan_total = len(targets)
+        self._current_proto = ""
+        self.identity_lock = threading.Lock()
 
     def _build_creds(self) -> list[Cred]:
         if self.kerberos:
@@ -648,7 +678,11 @@ class MarkSploit:
         current = ""
         if self._total > 0:
             tb = self._bar(self._done, self._total, 15)
-            current = f"  {DIM}│{RESET}  {DIM}{tb} {self._done}/{self._total} protos{RESET}"
+            label = f"  checking {self._current_proto}" if self._current_proto else ""
+            current = (f"  {DIM}│{RESET}  {DIM}{tb} "
+                       f"{self._done}/{self._total} protos{label}{RESET}")
+        elif self._current_proto:
+            current = f"  {DIM}│ scanning {self._current_proto}{RESET}"
         if not overall and not current: return
         sys.stderr.write(f"\r\033[K  {overall}{current}  ")
         sys.stderr.flush()
@@ -660,10 +694,9 @@ class MarkSploit:
     def _clear_progress(self) -> None:
         sys.stderr.write("\r\033[K"); sys.stderr.flush()
 
-    def _say(self, proto, ip, port, host, marker, msg) -> None:
+    def _say(self, proto, ip, port, host, marker, msg, block_key: str = "") -> None:
         with self._progress_lock:
             self._clear_progress()
-            print_cme(proto, ip, port, host, marker, msg)
             self._redraw()
 
     # ── subprocess ────────────────────────────────────────────────────
@@ -698,8 +731,9 @@ class MarkSploit:
 
     # ── scan one (protocol, scope) ─────────────────────────────────────
     def _scan_protocol(self, proto, target, local_auth,
-                       target_ip, hostname,
-                       host_skip: threading.Event
+                       shared_identity,
+                       host_skip: threading.Event,
+                       show_progress: bool = True
                        ) -> tuple[list[tuple[str,str]], list[Success], str]:
         lines: list[tuple[str,str]] = []
         successes: list[Success]    = []
@@ -707,12 +741,18 @@ class MarkSploit:
         consecutive_timeouts = 0
         scope_label = "local" if local_auth else "domain"
         port = PROTOCOL_PORTS.get(proto, 0)
+        had_output = False
 
         for cred_idx, cred in enumerate(self.creds):
             if self._stop.is_set() or host_skip.is_set():
                 break
             if cred.is_hash     and proto not in WINDOWS_PROTOS: continue
             if cred.is_kerberos and proto not in WINDOWS_PROTOS: continue
+
+            if show_progress:
+                with self._progress_lock:
+                    self._current_proto = f"{proto.upper()}/{scope_label}"
+                    self._redraw()
 
             cmd = self._nxc_cmd(proto, target, cred, local_auth)
             try:
@@ -725,7 +765,11 @@ class MarkSploit:
                 if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
                     msg = f"{MAX_CONSECUTIVE_TIMEOUTS} consecutive timeouts — skipped"
                     lines.append(("[!]", msg))
-                    self._say(proto, target_ip, port, hostname, "[!]", msg)
+                    with self.identity_lock:
+                        live_ip = shared_identity["real_ip"] or target
+                        live_host = shared_identity["hostname"] or target
+                    if show_progress:
+                        self._say(proto, live_ip, port, live_host, "[!]", msg, target)
                     if self.timeout_skip:
                         host_skip.set()   # tell sibling protocols to bail out too
                     break
@@ -734,7 +778,26 @@ class MarkSploit:
 
             for raw in stdout.split("\n"):
                 marker, msg = parse_nxc_line(raw.strip())
+                if marker:
+                    had_output = True
+
+                discovered_ip = extract_ipv4(msg)
+                if discovered_ip:
+                    with self.identity_lock:
+                        shared_identity["real_ip"] = discovered_ip
+
+                discovered_host = extract_hostname(msg)
+                if discovered_host:
+                    with self.identity_lock:
+                        shared_identity["hostname"] = discovered_host
+
+                discovered_domain = extract_domain(msg)
+                if discovered_domain:
+                    with self.identity_lock:
+                        shared_identity["domain"] = discovered_domain
+
                 if marker == "[*]":
+                    lines.append((marker, msg))
                     if not target_info: target_info = msg
                 elif marker == "[+]":
                     sn = f" ({scope_label})" if local_auth else ""
@@ -746,17 +809,27 @@ class MarkSploit:
                         domain=domain, user=user, secret=secret,
                         auth_type=cred.auth_type,
                         is_admin=is_admin, is_guest=is_guest, raw_message=msg))
-                    self._say(proto, target_ip, port, hostname, "[+]", msg + sn)
+                    with self.identity_lock:
+                        live_ip = shared_identity["real_ip"] or target
+                        live_host = shared_identity["hostname"] or target
+                    if show_progress:
+                        self._say(proto, live_ip, port, live_host, "[+]", msg + sn, target)
                 elif marker in ("[-]", "[!]"):
                     lines.append((marker, msg))
 
             if stderr and not stdout:
                 for raw in stderr.split("\n"):
                     if raw.strip(): lines.append(("[-]", raw.strip()))
+        if not lines and proto in self.protocols:
+            message = f"{proto.upper()} service detected"
+            if not had_output:
+                message += " (no nxc output)"
+            lines.append(("[*]", message))
         return lines, successes, target_info
 
     # ── anon SMB probe ─────────────────────────────────────────────────
-    def _scan_anon_smb(self, target, target_ip, hostname) -> tuple[list[str],bool]:
+    def _scan_anon_smb(self, target, target_ip, hostname,
+                       show_progress: bool = True) -> tuple[list[str],bool]:
         cmd = ["nxc","smb",target,"-u","","-p","",
                "--timeout",str(NETEXEC_TIMEOUT),"--log",self.log_file]
         try:
@@ -772,7 +845,9 @@ class MarkSploit:
             marker, msg = parse_nxc_line(line)
             if marker == "[+]":
                 success = True
-                self._say("SMB", target_ip, 445, hostname, "[+]", msg + " (anonymous)")
+                if show_progress:
+                    self._say("SMB", target_ip, 445, hostname, "[+]",
+                              msg + " (anonymous)", target)
         if stderr and not stdout:
             for raw in stderr.split("\n"):
                 if raw.strip(): out_lines.append(raw.strip())
@@ -799,7 +874,8 @@ class MarkSploit:
 
     # ── one target ─────────────────────────────────────────────────────
     def _scan_target(self, target: str,
-                     preprobed_protos: list[str]|None = None) -> TargetResult:
+                     preprobed_protos: list[str]|None = None,
+                     show_progress: bool = True) -> TargetResult:
         result = TargetResult(target=target)
 
         if preprobed_protos is not None:
@@ -815,6 +891,11 @@ class MarkSploit:
             result.scanned = False; result.skipped_reason = "no open ports"
             return result
 
+        shared_identity = {
+            "real_ip": target,
+            "hostname": "",
+            "domain": "",
+        }
         _ip = target; _host = ""
         tasks: list[tuple[str,bool]] = []
         for proto in open_protos:
@@ -822,8 +903,9 @@ class MarkSploit:
             if proto in LOCAL_AUTH_PROTOS and not self.kerberos:
                 tasks.append((proto, True))
 
-        with self._progress_lock:
-            self._done = 0; self._total = len(tasks); self._redraw()
+        if show_progress:
+            with self._progress_lock:
+                self._done = 0; self._total = len(tasks); self._redraw()
 
         start = time.time()
         host_skip = threading.Event()
@@ -831,11 +913,12 @@ class MarkSploit:
         with ThreadPoolExecutor(max_workers=max(2, self.workers)) as pool:
             anon_future = None
             if "smb" in open_protos and not self.kerberos:
-                anon_future = pool.submit(self._scan_anon_smb, target, _ip, _host)
+                anon_future = pool.submit(self._scan_anon_smb, target, _ip, _host,
+                                          show_progress)
 
             future_to_task = {
                 pool.submit(self._scan_protocol, proto, target, scope,
-                            _ip, _host, host_skip): (proto, scope)
+                            shared_identity, host_skip, show_progress): (proto, scope)
                 for proto, scope in tasks
             }
             for fut in as_completed(future_to_task):
@@ -853,8 +936,9 @@ class MarkSploit:
                 if tinfo and not result.target_info: result.target_info = tinfo
                 for s in successes:
                     (result.guests if s.is_guest else result.successes).append(s)
-                with self._progress_lock:
-                    self._done += 1; self._redraw()
+                if show_progress:
+                    with self._progress_lock:
+                        self._done += 1; self._redraw()
 
             if anon_future is not None:
                 try:
@@ -863,21 +947,20 @@ class MarkSploit:
                     al = [f"[!] Anonymous SMB error: {exc}"]; as_ = False
                 result.anon_smb_lines = al; result.anon_smb = as_
 
-        result.hostname = extract_hostname(result.target_info)
-        result.domain   = extract_domain(result.target_info)
-        result.is_dc    = looks_like_dc(result.target_info)
+        with self.identity_lock:
+            cached_ip = shared_identity["real_ip"]
+            cached_host = shared_identity["hostname"]
+            cached_domain = shared_identity["domain"]
 
-        for k, lines in result.protocol_lines.items():
-            for _, msg in lines:
-                ip = extract_ipv4(msg)
-                if ip: result.real_ip = ip; break
-            if result.real_ip: break
-        if not result.real_ip:
+        result.hostname = cached_host or extract_hostname(result.target_info)
+        result.domain   = cached_domain or extract_domain(result.target_info)
+        result.is_dc    = looks_like_dc(result.target_info)
+        result.real_ip  = cached_ip or target
+
+        if result.real_ip == target:
             for line in result.anon_smb_lines:
                 ip = extract_ipv4(line)
                 if ip: result.real_ip = ip; break
-        if not result.real_ip:
-            result.real_ip = target
 
         # ── auto-enum shares on anon/guest hits ────────────────────────
         if self.auto_enum and (result.anon_smb or result.guests):
@@ -885,7 +968,8 @@ class MarkSploit:
                 result.real_ip, result.hostname)
 
         result.elapsed = time.time() - start
-        self._clear_progress()
+        if show_progress:
+            self._clear_progress()
         return result
 
     # ── spray mode ─────────────────────────────────────────────────────
@@ -1009,43 +1093,100 @@ class MarkSploit:
 
         results: list[TargetResult] = []
         try:
-            for target in self.targets:
-                if self._stop.is_set(): break
-                try:
-                    r = self._scan_target(target)
-                    with self._progress_lock:
-                        self._scan_done += 1
-                        self._done = self._total = 0
-                    print_target_block(r, self.extra_hash, self.verbose)
-                    sys.stdout.flush()
-                    with self._progress_lock: self._redraw()
-                    if self.creds_file and r.successes:
-                        try: append_creds(self.creds_file, r)
-                        except OSError as exc:
-                            print_info("[!]", f"could not write creds file: {exc}")
-                    results.append(r)
-                except KeyboardInterrupt:
-                    raise
-                except Exception as exc:
-                    self._clear_progress()
-                    print_info("[!]", f"error on {target}: {exc.__class__.__name__}: {exc}")
-                    if self.debug:
-                        import traceback; traceback.print_exc()
-                    else:
-                        print_info("[!]", "re-run with --debug for traceback")
-                    failed = TargetResult(target=target)
-                    failed.scanned = False
-                    failed.skipped_reason = f"error: {exc.__class__.__name__}"
-                    results.append(failed)
+            target_workers = min(self.target_workers, len(self.targets))
+            if target_workers <= 1:
+                for target in self.targets:
+                    if self._stop.is_set(): break
+                    try:
+                        r = self._scan_target(target)
+                        with self._progress_lock:
+                            self._scan_done += 1
+                            self._done = self._total = 0
+                            self._clear_progress()
+                        print_target_block(r, self.extra_hash, self.verbose)
+                        sys.stdout.flush()
+                        with self._progress_lock:
+                            if self._scan_done < self._scan_total:
+                                self._redraw()
+                        if self.creds_file and r.successes:
+                            try: append_creds(self.creds_file, r)
+                            except OSError as exc:
+                                print_info("[!]", f"could not write creds file: {exc}")
+                        results.append(r)
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:
+                        r = self._failed_result(target, exc)
+                        results.append(r)
+            else:
+                with self._progress_lock:
+                    self._done = self._total = 0
+                    self._scan_done = 0
+                    self._scan_total = len(self.targets)
+                    self._current_proto = f"with {target_workers} target workers"
+                    self._redraw()
+
+                with ThreadPoolExecutor(max_workers=target_workers) as pool:
+                    future_to_target = {
+                        pool.submit(self._scan_target, target, None, False): target
+                        for target in self.targets
+                    }
+                    for fut in as_completed(future_to_target):
+                        if self._stop.is_set(): break
+                        target = future_to_target[fut]
+                        try:
+                            r = fut.result()
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as exc:
+                            r = self._failed_result(target, exc)
+                        with self._progress_lock:
+                            self._scan_done += 1
+                            self._clear_progress()
+                        print_target_block(r, self.extra_hash, self.verbose)
+                        sys.stdout.flush()
+                        with self._progress_lock:
+                            if self._scan_done < self._scan_total:
+                                self._redraw()
+                        if self.creds_file and r.successes:
+                            try: append_creds(self.creds_file, r)
+                            except OSError as exc:
+                                print_info("[!]", f"could not write creds file: {exc}")
+                        results.append(r)
         finally:
             self._clear_progress()
             if len(results) > 1 and not self._stop.is_set():
                 self._print_summary(results)
+                self._print_probe_warning(results)
             if self.json_out:    self._write_json(results)
             if self.script_file: self._write_script(results)
             if not self._stop.is_set():
                 self._print_next_steps(results)
         return 130 if self._stop.is_set() else 0
+
+    def _failed_result(self, target: str, exc: Exception) -> TargetResult:
+        self._clear_progress()
+        print_info("[!]", f"error on {target}: {exc.__class__.__name__}: {exc}")
+        if self.debug:
+            import traceback; traceback.print_exc()
+        else:
+            print_info("[!]", "re-run with --debug for traceback")
+        failed = TargetResult(target=target)
+        failed.scanned = False
+        failed.skipped_reason = f"error: {exc.__class__.__name__}"
+        return failed
+
+    def _print_probe_warning(self, results: list[TargetResult]) -> None:
+        if self.no_port_probe:
+            return
+        skipped = [r for r in results if not r.scanned and r.skipped_reason == "no open ports"]
+        if not skipped:
+            return
+        print_info("[!]", f"port probe skipped {len(skipped)}/{len(results)} targets with no open checked ports")
+        if len(skipped) == len(results):
+            print_info("[!]", "no targets reached nxc; retry with --no-port-probe or raise --target-workers more slowly")
+            print_info("[*]", "example: marksploit -t <target> -u <user> -p <pass> --no-port-probe --target-workers 3")
+        print()
 
     # ── banner ─────────────────────────────────────────────────────────
     def _print_banner(self) -> None:
@@ -1056,6 +1197,8 @@ class MarkSploit:
         print_info("[*]", f"{CYAN}{BOLD}marksploit{RESET}  |  "
                           f"{len(self.targets)} targets  "
                           f"{len(self.users)} users  {cl}  {self.workers} workers")
+        if not self.spray:
+            print_info("[*]", f"target workers: {self.target_workers}")
         print_info("[*]", f"protocols: {pl}  timeout: {NETEXEC_TIMEOUT}s/attempt")
         if self.spray:
             delay_str = f"{self.spray_delay}s delay" if self.spray_delay else "no delay"
@@ -1080,7 +1223,7 @@ class MarkSploit:
         for r in results:
             if not r.scanned: continue
             ip     = r.real_ip or r.target
-            host   = r.hostname or ip
+            host   = r.hostname or r.target
             ok     = r.successes or r.anon_smb
             marker = "[+]" if ok else "[-]"
             proto  = (r.open_protocols[0] if r.open_protocols else "smb").upper()
@@ -1333,6 +1476,9 @@ def parse_args() -> argparse.Namespace:
     misc.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
         metavar="N",
         help=f"Parallel workers per target. Default: {DEFAULT_WORKERS}.")
+    misc.add_argument("--target-workers", type=int, default=DEFAULT_TARGET_WORKERS,
+        metavar="N",
+        help=f"Parallel targets in normal mode. Default: {DEFAULT_TARGET_WORKERS}.")
     misc.add_argument("-q", "--quiet", action="store_true",
         help="Suppress banner and next-steps section.")
     misc.add_argument("-v", "--verbose", action="store_true",
@@ -1390,7 +1536,8 @@ def main() -> int:
             protocols=protocols, log_file=log_file,
             creds_file=args.creds_file, json_out=args.json_output,
             save_file=args.save, script_file=args.script,
-            workers=args.workers, quiet=args.quiet, verbose=args.verbose,
+            workers=args.workers, target_workers=args.target_workers,
+            quiet=args.quiet, verbose=args.verbose,
             debug=args.debug, no_port_probe=args.no_port_probe,
             extra_hash=extra_hash,
             spray=args.spray, spray_delay=args.spray_delay,
