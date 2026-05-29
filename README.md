@@ -82,6 +82,24 @@ The shell script is `chmod +x`'d automatically. Review it before running — it 
 
 ---
 
+## Progress Display
+
+marksploit keeps a live progress line on stderr while scanning. In normal parallel mode, the host bar shows how many targets have completed and the status shows the active target-worker count:
+
+```text
+███████░░░░░░░░░░░░░ 100/254 hosts  │ scanning with 3 target workers
+```
+
+For per-target protocol progress, run a single target worker:
+
+```bash
+python3 marksploit.py -t targets.txt -u users.txt -p passwords.txt --target-workers 1
+```
+
+That mode shows the host bar plus the protocol/scope currently being checked. The progress line is cleared before result blocks are printed so it does not get mixed into the formatted host output.
+
+---
+
 ## Protocol Reference
 
 | Protocol | Default Port | Notes |
@@ -133,6 +151,8 @@ OUTPUT:
 MISC:
   --auto-enum       Auto-run share enum on anon/guest hits
   -w N              Parallel workers per target (default: 15)
+  --target-workers N
+                    Parallel targets in normal mode (default: 3)
   -q                Quiet — suppress banner and next-steps
   -v                Verbose — show [-] failure lines
   --no-color        Disable ANSI colours
@@ -166,8 +186,8 @@ After the scan, `followup.sh` contains pre-filled commands for every hit — sec
 
 ```
 [*] marksploit  |  254 targets  3 users  3p / 0h  15 workers
+[*] target workers: 3
 [*] protocols: smb,winrm,rdp  timeout: 30s/attempt
-[*] mode: SPRAY  (30s delay between rounds)
 
 ────────────────────────────────────────────────────────────────
 
