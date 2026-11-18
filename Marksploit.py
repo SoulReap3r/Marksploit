@@ -52,11 +52,11 @@ class Tee:
 
 
 # ─── Colors ────────────────────────────────────────────────────────────
-RED = GREEN = YELLOW = BLUE = CYAN = BOLD = DIM = RESET = ""
+RED = GREEN = YELLOW = BLUE = CYAN = ORANGE = BOLD = DIM = RESET = ""
 _COLOR_CODES = {
     "RED": "\033[91m", "GREEN": "\033[92m", "YELLOW": "\033[93m",
-    "BLUE": "\033[94m", "CYAN": "\033[96m", "BOLD": "\033[1m",
-    "DIM": "\033[2m",   "RESET": "\033[0m",
+    "BLUE": "\033[94m", "CYAN": "\033[96m", "ORANGE": "\033[38;5;208m",
+    "BOLD": "\033[1m", "DIM": "\033[2m",   "RESET": "\033[0m",
 }
 
 def configure_colors(no_color: bool) -> None:
@@ -64,6 +64,14 @@ def configure_colors(no_color: bool) -> None:
         return
     for name, code in _COLOR_CODES.items():
         globals()[name] = code
+
+
+# NT hash (32 hex) or LM:NT pair — highlighted orange wherever it appears.
+_HASH_RE = re.compile(r"\b[a-fA-F0-9]{32}(?::[a-fA-F0-9]{32})?\b")
+def hl_hash(text: str, base: str = "") -> str:
+    if not ORANGE:
+        return text
+    return _HASH_RE.sub(lambda m: f"{ORANGE}{m.group(0)}{RESET}{base}", text)
 
 
 # ─── Protocol config ───────────────────────────────────────────────────
@@ -155,7 +163,7 @@ def print_cme(proto,ip,port,hostname,marker,msg) -> None:
 
 def print_info(marker: str, msg: str, indent: int = 0) -> None:
     color = _marker_color(marker)
-    body  = f"{'  '*indent}{marker} {msg}"
+    body  = f"{'  '*indent}{marker} {hl_hash(msg, color)}"
     print(f"{color}{body}{RESET}" if color else body, flush=True)
 
 _SEP = f"{DIM}{'─'*64}{RESET}"
@@ -455,7 +463,7 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
 
     def iprint(marker: str, msg: str, indent: int = 1) -> None:
         color = _marker_color(marker)
-        body  = f"{'  '*indent}{marker} {msg}"
+        body  = f"{'  '*indent}{marker} {hl_hash(msg, color)}"
         print(f"{color}{body}{RESET}" if color else body, flush=True)
 
     def sort_key(s: Success) -> tuple[int,int]:
