@@ -83,8 +83,7 @@ SUBPROCESS_TIMEOUT       = 45
 PORT_PROBE_TIMEOUT       = 2.0
 MAX_CONSECUTIVE_TIMEOUTS = 3
 DEFAULT_MAX_CIDR_HOSTS   = 1024
-DEFAULT_SPRAY_DELAY      = 30    # seconds between spray rounds
-LOCKOUT_WARN_THRESHOLD   = 3     # warn if more creds than this in non-spray mode
+DEFAULT_SPRAY_DELAY      = 0     # no delay by default (OSCP boxes have no lockout)
 
 
 # ─── Data classes ──────────────────────────────────────────────────────
@@ -1004,13 +1003,6 @@ class MarkSploit:
         if not alive:
             print_info("[!]", "no reachable targets"); return 0
 
-        # Lockout warning
-        if len(self.creds) > LOCKOUT_WARN_THRESHOLD:
-            print_info("[!]", f"{YELLOW}{BOLD}LOCKOUT WARNING{RESET}  "
-                              f"{len(self.creds)} rounds — verify AD lockout policy")
-        if self.spray_delay == 0 and len(self.creds) > 1:
-            print_info("[!]", "no --spray-delay set — "
-                              "recommend 30s+ for AD environments to stay under threshold")
         print()
 
         orig_creds  = self.creds
@@ -1091,13 +1083,6 @@ class MarkSploit:
             return self._run_spray()
 
         if not self.quiet: self._print_banner()
-
-        # Lockout warning for non-spray multi-cred runs
-        if not self.quiet and len(self.creds) > LOCKOUT_WARN_THRESHOLD:
-            print_info("[!]", f"{YELLOW}{BOLD}LOCKOUT WARNING{RESET}  "
-                              f"{len(self.creds)} creds against each target — "
-                              f"consider --spray with --spray-delay for AD")
-            print()
 
         results: list[TargetResult] = []
         try:
