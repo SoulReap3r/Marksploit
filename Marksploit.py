@@ -220,6 +220,10 @@ def extract_hostname(info: str) -> str:
     return extract_ssh_hostname(info)
 
 def extract_domain(info: str) -> str:
+    # The NetBIOS/local name sits on "(local)" lines and is NOT the Kerberos
+    # realm. Skip those so we keep the FQDN (e.g. corp.local), not the short name.
+    if "(local)" in info.lower():
+        return ""
     m = re.search(r"domain:([^\s)]+)", info, re.IGNORECASE)
     return m.group(1) if m else ""
 
@@ -794,7 +798,11 @@ class MarkSploit:
                 discovered_domain = extract_domain(msg)
                 if discovered_domain:
                     with self.identity_lock:
-                        shared_identity["domain"] = discovered_domain
+                        existing = shared_identity.get("domain", "")
+                        # Prefer the dotted FQDN realm; never let a short NetBIOS
+                        # name overwrite a realm we've already found.
+                        if "." in discovered_domain or "." not in existing:
+                            shared_identity["domain"] = discovered_domain
 
                 if marker == "[*]":
                     lines.append((marker, msg))
