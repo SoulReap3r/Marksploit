@@ -623,7 +623,7 @@ class MarkSploit:
     def __init__(self, *, targets, users, passwords, hashes, kerberos,
                  protocols, log_file, creds_file, json_out, save_file, script_file,
                  workers, target_workers, quiet, verbose, debug, no_port_probe, extra_hash,
-                 spray, spray_delay, auto_enum, timeout_skip):
+                 spray, spray_delay, auto_enum, timeout_skip, deleg=True):
         self.targets      = targets
         self.users        = users
         self.passwords    = passwords
@@ -646,6 +646,7 @@ class MarkSploit:
         self.spray_delay  = spray_delay
         self.auto_enum    = auto_enum
         self.timeout_skip = timeout_skip
+        self.deleg        = deleg
 
         self.creds = self._build_creds()
         if not self.creds:
@@ -1080,6 +1081,7 @@ class MarkSploit:
 
         self._clear_progress()
         if len(results) > 1: self._print_summary(results)
+        self._run_delegation(results)
         if self.json_out:    self._write_json(results)
         if self.script_file: self._write_script(results)
         self._print_next_steps(results)
@@ -1160,6 +1162,8 @@ class MarkSploit:
             if len(results) > 1 and not self._stop.is_set():
                 self._print_summary(results)
                 self._print_probe_warning(results)
+            if not self._stop.is_set():
+                self._run_delegation(results)
             if self.json_out:    self._write_json(results)
             if self.script_file: self._write_script(results)
             if not self._stop.is_set():
@@ -1318,6 +1322,73 @@ class MarkSploit:
         except OSError as exc:
             print_info("[!]", f"could not write script: {exc}")
 
+    # ── read-only AD enrichment (delegation / roastability) ────────────
+    def _ldap_base(self, dc_ip: str, s: Success) -> list[str]:
+        cmd = ["nxc", "ldap", dc_ip, "-u", s.user]
+        if   s.auth_type == AuthType.KERBEROS: cmd.append("--use-kcache")
+        elif s.auth_type == AuthType.HASH:     cmd.extend(["-H", s.secret])
+        else:                                  cmd.extend(["-p", s.secret])
+        cmd.extend(["--timeout", str(NETEXEC_TIMEOUT)])
+        return cmd
+
+    def _run_delegation(self, results: list[TargetResult]) -> None:
+        """Read-only LDAP enrichment on a DC we have a valid domain cred for.
+        Enumerate only — report findings and the attack commands; never exploit."""
+        if self.quiet or not self.deleg or self._stop.is_set():
+            return
+        pick = None
+        for r in results:
+            if r.is_dc and r.real_ip:
+                s = next((x for x in r.successes
+                          if not x.local_auth and not x.is_guest), None)
+                if s:
+                    pick = (r, s); break
+        if not pick:
+            return
+        r, s = pick
+        dc_ip = r.real_ip
+        base  = self._ldap_base(dc_ip, s)
+        SPN   = "(&(samAccountType=805306368)(servicePrincipalName=*)(!(cn=krbtgt)))"
+        ASREP = "(&(samAccountType=805306368)(userAccountControl:1.2.840.113556.1.4.803:=4194304))"
+        checks = [
+            ("kerberoastable (SPN) accounts", base + ["--query", SPN, "sAMAccountName"]),
+            ("AS-REP roastable (no preauth)", base + ["--query", ASREP, "sAMAccountName"]),
+            ("unconstrained delegation",      base + ["--trusted-for-delegation"]),
+            ("all delegation rights",         base + ["--find-delegation"]),
+            ("password-not-required accounts",base + ["--password-not-required"]),
+            ("adminCount=1 (protected)",      base + ["--admin-count"]),
+            ("MachineAccountQuota",           base + ["-M", "maq"]),
+        ]
+        print()
+        print_info("[*]", f"AD enrichment — read-only LDAP checks on "
+                          f"{r.hostname or dc_ip} as {s.user}  (--no-deleg to skip)")
+        for label, cmd in checks:
+            if self._stop.is_set():
+                break
+            stdout, _, timed = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
+            if timed:
+                print_info("[-]", f"{label}: timed out", indent=1); continue
+            # Surface nxc's own [+] finding lines, trimmed of the connection noise.
+            hits = []
+            for raw in _ANSI_RE.sub("", stdout).splitlines():
+                line = raw.strip()
+                if not line or "[*]" in line[:40] or "[-]" in line[:40]:
+                    continue
+                if "[+]" in line:
+                    # keep the message after the [+] marker
+                    line = line.split("[+]", 1)[1].strip()
+                    # drop the plain bind-success echo
+                    if "\\" in line and ":" in line and " " not in line.split(":")[0]:
+                        continue
+                hits.append(line)
+            if hits:
+                print_info("[+]", f"{label}  ({len(hits)}):", indent=1)
+                for h in hits[:40]:
+                    print(f"      {h}", flush=True)
+            else:
+                print_info("[*]", f"{label}: none found", indent=1)
+        print()
+
     # ── next steps ─────────────────────────────────────────────────────
     def _print_next_steps(self, results: list[TargetResult]) -> None:
         if self.quiet: return
@@ -1475,6 +1546,9 @@ def parse_args() -> argparse.Namespace:
     misc.add_argument("--auto-enum", action="store_true",
         help="Auto-run share enumeration (nxc --shares) on any anon/guest hits "
              "and fold results into the output block.")
+    misc.add_argument("--no-deleg", action="store_true",
+        help="Skip the automatic read-only AD enrichment (delegation / roastability "
+             "/ MachineAccountQuota LDAP checks) that runs on a valid DC login.")
     misc.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
         metavar="N",
         help=f"Parallel workers per target. Default: {DEFAULT_WORKERS}.")
@@ -1544,6 +1618,7 @@ def main() -> int:
             extra_hash=extra_hash,
             spray=args.spray, spray_delay=args.spray_delay,
             auto_enum=args.auto_enum, timeout_skip=args.timeout_skip,
+            deleg=not args.no_deleg,
         )
     except ValueError as exc:
         print(f"{RED}{BOLD}Error:{RESET} {exc}", file=sys.stderr)
