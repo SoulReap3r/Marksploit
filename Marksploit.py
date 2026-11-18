@@ -66,12 +66,13 @@ def configure_colors(no_color: bool) -> None:
         globals()[name] = code
 
 
-# NT hash (32 hex) or LM:NT pair — highlighted orange wherever it appears.
-_HASH_RE = re.compile(r"\b[a-fA-F0-9]{32}(?::[a-fA-F0-9]{32})?\b")
-def hl_hash(text: str, base: str = "") -> str:
+# "#" comment tags in the output — highlighted orange so labels stand out
+# from the commands beneath them.
+_COMMENT_RE = re.compile(r"#[^\n]*")
+def hl_comment(text: str, base: str = "") -> str:
     if not ORANGE:
         return text
-    return _HASH_RE.sub(lambda m: f"{ORANGE}{m.group(0)}{RESET}{base}", text)
+    return _COMMENT_RE.sub(lambda m: f"{ORANGE}{m.group(0)}{RESET}{base}", text)
 
 
 # ─── Protocol config ───────────────────────────────────────────────────
@@ -163,7 +164,7 @@ def print_cme(proto,ip,port,hostname,marker,msg) -> None:
 
 def print_info(marker: str, msg: str, indent: int = 0) -> None:
     color = _marker_color(marker)
-    body  = f"{'  '*indent}{marker} {hl_hash(msg, color)}"
+    body  = f"{'  '*indent}{marker} {hl_comment(msg, color)}"
     print(f"{color}{body}{RESET}" if color else body, flush=True)
 
 _SEP = f"{DIM}{'─'*64}{RESET}"
@@ -428,7 +429,7 @@ def print_suggested_commands(result: TargetResult, extra_hash: str|None) -> None
     for proto_hdr, entries in blocks:
         print(f"  [{proto_hdr}]", flush=True)
         for sub_label, cmd in entries:
-            print(f"    # {sub_label}", flush=True)
+            print(f"    {ORANGE}# {sub_label}{RESET}", flush=True)
             print(f"    {cmd}",        flush=True)
         print(flush=True)
 
@@ -463,7 +464,7 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
 
     def iprint(marker: str, msg: str, indent: int = 1) -> None:
         color = _marker_color(marker)
-        body  = f"{'  '*indent}{marker} {hl_hash(msg, color)}"
+        body  = f"{'  '*indent}{marker} {hl_comment(msg, color)}"
         print(f"{color}{body}{RESET}" if color else body, flush=True)
 
     def sort_key(s: Success) -> tuple[int,int]:
@@ -510,7 +511,7 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
             ("recursive pull SYSVOL", f"smbclient //{ip}/SYSVOL -N -c "
                                       f"'recurse ON; prompt OFF; mget *'"),
         ]:
-            print(f"      # {label}", flush=True)
+            print(f"      {ORANGE}# {label}{RESET}", flush=True)
             print(f"      {cmd}",    flush=True)
             print(flush=True)
 
