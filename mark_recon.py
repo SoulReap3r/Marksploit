@@ -763,6 +763,23 @@ class MarkRecon:
     def _clear_progress(self) -> None:
         sys.stderr.write("\r\033[K"); sys.stderr.flush()
 
+    def _spin_nmap(self, future, ip: str) -> None:
+        """Show a spinner while the background nmap scan finishes, so it doesn't
+        look frozen after the fast nxc protocol pass."""
+        if self.quiet or not sys.stderr.isatty():
+            return
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        i = 0
+        scope = "all 65535 ports" if self.nmap_full else f"top {self.nmap_top} ports"
+        while not future.done() and not self._stop.is_set():
+            with self._progress_lock:
+                sys.stderr.write(
+                    f"\r\033[K  {CYAN}[*]{RESET} {frames[i % len(frames)]} "
+                    f"nmap service scan {ip} ({scope}) — this is the slow part, hang on…")
+                sys.stderr.flush()
+            time.sleep(0.15); i += 1
+        self._clear_progress()
+
     def _say(self, proto, ip, port, host, marker, msg, block_key: str = "") -> None:
         with self._progress_lock:
             self._clear_progress()
@@ -1018,6 +1035,7 @@ class MarkRecon:
         if not open_protos:
             # web-only host: no nxc protocols to test, just collect the nmap scan
             if nmap_future is not None:
+                if show_progress: self._spin_nmap(nmap_future, target)
                 try: result.nmap_ports = nmap_future.result()
                 except Exception: pass
             result.elapsed = time.time() - start
@@ -1101,6 +1119,7 @@ class MarkRecon:
 
         # collect the background nmap service scan
         if nmap_future is not None:
+            if show_progress: self._spin_nmap(nmap_future, target)
             try:
                 result.nmap_ports = nmap_future.result()
             except Exception as exc:
