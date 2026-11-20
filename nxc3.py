@@ -1091,10 +1091,14 @@ class Nxc3:
                 lines = [l for l in lines
                          if not (l.split()[:1] == ["Share"] and "Permissions" in l)]
             if label.startswith("GPP"):
-                # the module reprints the share table — keep only real cred lines
+                # the module reprints the share table — keep only real cred lines.
+                # nxc prints: "Password: x" / "userName: x" / "accountName: x" /
+                # "runAs: x" (gpp_password) and "Usernames: [...]" / "Passwords:
+                # [...]" / "Domains: [...]" (gpp_autologin, note the plural -s).
                 lines = [l for l in lines
-                         if re.search(r"(?i)\b(user(name)?|pass(word)?|"
-                                      r"cpassword|credential)\b", l)]
+                         if re.search(r"(?i)\b(?:user(?:name)?s?|pass(?:word)?s?|"
+                                      r"cpassword|credential|accountname|runas|"
+                                      r"domains?)\b", l)]
             if lines: out.append((label, lines))
         return out
 
