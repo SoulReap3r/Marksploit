@@ -209,5 +209,24 @@ gs = cred_shares_filter(good_shares)
 check("cred-enum: clean shares survive the noise filter (no false positives)",
       len(gs) == 3 and not _nxc_errored(good_shares), gs)
 
+# ══ 11. AD-enrichment path applies the same noise filter (PRIME TARGETS safe) ═
+# _run_delegation must not capture an nxc traceback as delegation/admin-count
+# "findings" — that would poison PRIME TARGETS and the delegation next-steps.
+deleg_err = """LDAP 192.0.2.97 389 DC01 [06:00:00] ERROR    LDAP bind failed    connection.py:187
+LDAP 192.0.2.97 389 DC01 ╭── Traceback (most recent call last) ───────────╮
+LDAP 192.0.2.97 389 DC01 │ /usr/lib/python3/dist-packages/nxc/protocols/ldap.py:300 │
+LDAP 192.0.2.97 389 DC01 │ ❱ 300 │   self.find_delegation()                 │
+LDAP 192.0.2.97 389 DC01 ╰────────────────────────────────────────────────╯"""
+enrich = [h for h in parse(deleg_err) if not _is_nxc_noise(h)]
+check("enrichment: traceback not captured as findings", enrich == [], enrich)
+check("enrichment: hard error detected (not reported as 'none found')", _nxc_errored(deleg_err))
+
+admincount = """LDAP 192.0.2.97 389 DC01 Administrator
+LDAP 192.0.2.97 389 DC01 svcadmin
+LDAP 192.0.2.97 389 DC01 helpdesk"""
+ac = [h for h in parse(admincount) if not _is_nxc_noise(h)]
+check("enrichment: clean admin-count names survive the filter",
+      ac == ["Administrator", "svcadmin", "helpdesk"] and not _nxc_errored(admincount), ac)
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)

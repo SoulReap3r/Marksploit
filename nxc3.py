@@ -1677,12 +1677,18 @@ class Nxc3:
             stdout, _, timed = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
             if timed:
                 print_info("[-]", f"{label}: timed out", indent=1); continue
-            hits = self._parse_nxc_findings(stdout)
+            # Same hardening as _cred_enum: never let an nxc traceback/error be
+            # captured as "findings" (which would poison PRIME TARGETS / the
+            # delegation next-steps) — and don't call a hard error "none found".
+            hits = [h for h in self._parse_nxc_findings(stdout)
+                    if not _is_nxc_noise(h)]
             found[label] = hits
             if hits:
                 print_info("[+]", f"{label}  ({len(hits)}):", indent=1)
                 for h in hits[:40]:
                     print(f"      {h}", flush=True)
+            elif _nxc_errored(stdout):
+                print_info("[-]", f"{label}: enumeration error (see raw nxc log)", indent=1)
             else:
                 print_info("[*]", f"{label}: none found", indent=1)
         self._deleg_next_steps(found, dc_ip, r.domain or "domain.local")
