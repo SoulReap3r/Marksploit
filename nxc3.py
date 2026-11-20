@@ -1398,6 +1398,42 @@ class Nxc3:
         self._print_next_steps(results)
         return 130 if self._stop.is_set() else 0
 
+    # ── host discovery pre-pass (CIDRs / large target sets) ────────────
+    def _discover_live(self, targets: list[str]) -> dict[str, list[str]]:
+        """Fast concurrent sweep: probe each address's nxc-protocol ports once
+        and keep only the hosts that answer. Lets a /24 find its handful of live
+        hosts up front, then deep-scan only those — instead of grinding the full
+        per-host pipeline (nmap + enum) across every address at target_workers."""
+        print_info("[*]", f"host discovery — sweeping {len(targets)} addresses "
+                          f"for live hosts ...")
+        alive: dict[str, list[str]] = {}
+        conc = min(len(targets), max(self.workers, 40))
+        with ThreadPoolExecutor(max_workers=conc) as pool:
+            futs = {pool.submit(probe_protocols, t, self.protocols): t
+                    for t in targets}
+            done = 0
+            for f in as_completed(futs):
+                t = futs[f]; done += 1
+                try:
+                    protos = f.result()
+                    if protos: alive[t] = protos
+                except Exception:
+                    pass
+                if not self.quiet and (done % 16 == 0 or done == len(targets)):
+                    sys.stderr.write(f"\r\033[K  [*] swept {done}/{len(targets)}  "
+                                     f"live: {len(alive)}")
+                    sys.stderr.flush()
+        if not self.quiet:
+            sys.stderr.write("\r\033[K"); sys.stderr.flush()
+        def _key(x):
+            try: return (0, int(ipaddress.ip_address(x)))
+            except ValueError: return (1, 0)
+        live_ips = sorted(alive, key=_key)
+        shown = ", ".join(live_ips[:12]) + (" ..." if len(live_ips) > 12 else "")
+        print_info("[*]", f"live hosts: {len(alive)}/{len(targets)}"
+                          + (f"  ->  {shown}" if alive else ""))
+        return alive
+
     # ── normal mode ────────────────────────────────────────────────────
     def run(self) -> int:
         if self.spray:
@@ -1406,6 +1442,18 @@ class Nxc3:
 
         if not self.quiet: self._print_banner()
 
+        # For a large target set (e.g. a CIDR), sweep for live hosts first and
+        # deep-scan only those — the nmap+enum pipeline should run on real hosts,
+        # not all 254 addresses. Small/explicit target lists skip this.
+        preprobed: dict[str, list[str]] | None = None
+        if (not self.no_port_probe and not self.recon_only
+                and len(self.targets) > max(self.target_workers, 8)):
+            preprobed = self._discover_live(self.targets)
+            if not preprobed:
+                print_info("[!]", "no reachable targets"); return 0
+            self.targets = [t for t in self.targets if t in preprobed]
+            print()
+
         results: list[TargetResult] = []
         try:
             target_workers = min(self.target_workers, len(self.targets))
@@ -1413,7 +1461,8 @@ class Nxc3:
                 for target in self.targets:
                     if self._stop.is_set(): break
                     try:
-                        r = self._scan_target(target)
+                        r = self._scan_target(
+                            target, preprobed.get(target) if preprobed else None)
                         with self._progress_lock:
                             self._scan_done += 1
                             self._done = self._total = 0
@@ -1443,7 +1492,9 @@ class Nxc3:
 
                 with ThreadPoolExecutor(max_workers=target_workers) as pool:
                     future_to_target = {
-                        pool.submit(self._scan_target, target, None, False): target
+                        pool.submit(self._scan_target, target,
+                                    preprobed.get(target) if preprobed else None,
+                                    False): target
                         for target in self.targets
                     }
                     for fut in as_completed(future_to_target):

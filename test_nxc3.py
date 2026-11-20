@@ -235,5 +235,22 @@ for p, kw in [(873, "rsync"), (1521, "oracle"), (5986, "winrm"),
           p in PORT_HINTS and kw in PORT_HINTS[p].lower() and "{ip}" in PORT_HINTS[p],
           PORT_HINTS.get(p))
 
+# ══ 13. host-discovery pre-pass keeps only live hosts (CIDR workflow) ═════════
+# A CIDR should be swept for live hosts first, then only those deep-scanned —
+# not the full pipeline across every address. _discover_live does that sweep;
+# stub the socket probe so the filtering logic is tested without a network.
+sc = Nxc3.__new__(Nxc3); sc.quiet = True; sc.workers = 10; sc.protocols = ["smb"]
+_orig_probe = _G["probe_protocols"]
+_G["probe_protocols"] = lambda host, protos: (["smb"] if host in ("192.0.2.5", "192.0.2.9") else [])
+try:
+    with redirect_stdout(io.StringIO()):
+        alive = sc._discover_live([f"192.0.2.{i}" for i in range(1, 30)])
+finally:
+    _G["probe_protocols"] = _orig_probe
+check("discovery: sweep keeps only responding hosts",
+      set(alive) == {"192.0.2.5", "192.0.2.9"}, alive)
+check("discovery: carries each live host's open protocols",
+      alive.get("192.0.2.5") == ["smb"], alive)
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)
