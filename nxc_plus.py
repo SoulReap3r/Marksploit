@@ -161,6 +161,10 @@ DEFAULT_MAX_CIDR_HOSTS   = 1024
 DEFAULT_SPRAY_DELAY      = 0     # no delay by default (OSCP boxes have no lockout)
 WORDLIST                 = "/usr/share/wordlists/rockyou.txt"
 HOME                     = os.path.expanduser("~")   # for RDP /drive share, not hardcoded
+# Default Windows shares — seeing these tells you nothing. ANYTHING else that is
+# readable is where creds/configs/flags hide, on every box (not lab-specific).
+STANDARD_SHARES          = {"ADMIN$", "C$", "D$", "E$", "F$", "G$", "IPC$",
+                            "PRINT$", "SYSVOL", "NETLOGON", "FAX$", "CERTENROLL"}
 
 
 # ─── Data classes ──────────────────────────────────────────────────────
@@ -1217,6 +1221,18 @@ class NxcPlus:
             if label == "shares":
                 lines = [l for l in lines
                          if not (l.split()[:1] == ["Share"] and "Permissions" in l)]
+                # Generic rule (every box): a READ/WRITE on a NON-default share is
+                # where loot lives — add a spider next-step automatically.
+                custom = [l.split()[0] for l in lines
+                          if l.split() and l.split()[0].upper() not in STANDARD_SHARES
+                          and re.search(r"\bREAD|\bWRITE", l)]
+                if custom:
+                    cf = f"-H {s.secret}" if s.is_hash else f"-p {s.secret}"
+                    la = " --local-auth" if s.local_auth else ""
+                    lines.append(f"{YELLOW}-> non-default readable share(s): "
+                                 f"{', '.join(custom)}  — spider for creds/configs:{RESET}")
+                    lines.append(f"   nxc smb {ip} -u {s.user} {cf}{la} -M spider_plus "
+                                 f"-o DOWNLOAD_FLAG=True")
             elif label == "users":
                 names = self._clean_usernames(lines)
                 result.domain_users = sorted(set(result.domain_users) | set(names))
