@@ -560,12 +560,15 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
         for what, how in notes:
             print(f"      {YELLOW}# {what}{RESET}  {how}", flush=True)
         print(flush=True)
-    else:
+    elif result.open_protocols or result.target_info or result.successes:
+        # host-identity echo — only for a host we actually protocol-scanned.
+        # A pure nmap-recon host (non-nxc ports only) is already identified by
+        # its "open ports" block above; don't fake an SMB line for it.
         proto = (result.open_protocols[0] if result.open_protocols else "smb").upper()
         port  = PROTOCOL_PORTS.get(result.open_protocols[0]
                                    if result.open_protocols else "smb", 0)
         print_cme(proto, ip, port, host or ip, "[*]", ip)
-    print(flush=True)
+        print(flush=True)
 
     def iprint(marker: str, msg: str, indent: int = 1) -> None:
         color = _marker_color(marker)
@@ -1134,27 +1137,34 @@ class Nxc3:
         result.open_protocols   = open_protos
         result.closed_protocols = [p for p in self.protocols if p not in open_protos]
 
-        # A host may be alive on a web port even with no nxc-protocol port open —
-        # don't let the protocol probe alone decide liveness for a recon tool.
-        web_open = []
-        if self.nmap and not open_protos and not self.no_port_probe:
-            web_open = [p for p in (80, 443, 8080, 8000) if tcp_probe(target, p)]
+        # A host may be alive on a non-nxc port (web, DNS, SNMP, mail, db) even
+        # with no nxc-protocol port open. Don't let the cheap protocol probe
+        # alone decide liveness for a recon tool: when it finds nothing, run the
+        # full nmap scan and surface whatever ports are actually open — the
+        # per-port hints (zone transfer, SNMP walk, gobuster, ...) still apply.
+        recon_ports: list[tuple[int, str, str]] = []
+        if (self.nmap and not open_protos and not self.no_port_probe
+                and not self._stop.is_set()):
+            try:
+                fut = self._nmap_pool.submit(self._nmap_scan, target)
+                if show_progress: self._spin_nmap(fut, target)
+                recon_ports = fut.result()
+            except Exception:
+                recon_ports = []
 
         # Deep service scan (nmap) runs in the background while the nxc protocol
         # scan happens — reveals web / non-standard ports the probe set misses.
         nmap_future = None
-        if self.nmap and (open_protos or web_open) and not self._stop.is_set():
+        if self.nmap and open_protos and not self._stop.is_set():
             nmap_future = self._nmap_pool.submit(self._nmap_scan, target)
 
-        if not open_protos and not web_open:
+        if not open_protos and not recon_ports:
             result.scanned = False; result.skipped_reason = "no open ports"
             return result
         if not open_protos:
-            # web-only host: no nxc protocols to test, just collect the nmap scan
-            if nmap_future is not None:
-                if show_progress: self._spin_nmap(nmap_future, target)
-                try: result.nmap_ports = nmap_future.result()
-                except Exception: pass
+            # no nxc protocol to authenticate against (web/DNS/mail/db/etc.) —
+            # nothing to test, but show the discovered ports + next-step hints.
+            result.nmap_ports = recon_ports
             result.elapsed = time.time() - start
             return result
 

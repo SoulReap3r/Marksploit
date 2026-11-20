@@ -152,5 +152,31 @@ grep_line = ("Host: 192.0.2.95 ()\tPorts: 135/open/tcp//msrpc///, "
 parsed = Nxc3._parse_nmap_grep(grep_line)
 check("nmap parse: finds 3 ports incl 8443", 8443 in parsed and 135 in parsed and 445 in parsed, parsed)
 
+# ══ 9. recon-only host (non-nxc ports): renders ports+hints, no phantom SMB ═══
+# A host whose only open port is non-nxc (e.g. DNS/53) used to render nothing,
+# because the nmap deep-scan was gated behind the nxc-protocol probe. It must
+# now surface the port + its hint, and must NOT fake an "SMB ... [*] <ip>" line.
+TargetResult       = _G["TargetResult"]
+print_target_block = _G["print_target_block"]
+def block_text(**kw):
+    r = TargetResult(target=kw.pop("target", "192.0.2.254"))
+    for k, v in kw.items(): setattr(r, k, v)
+    buf = io.StringIO()
+    with redirect_stdout(buf): print_target_block(r, None, False)
+    return _ANSI.sub("", buf.getvalue())
+
+recon = block_text(nmap_ports=[(53, "domain", "")])          # open_protocols empty
+check("recon-only: open-ports block rendered", "open ports (1)" in recon and "53/tcp" in recon, recon)
+check("recon-only: DNS next-step hint shown", "zone transfer" in recon, recon)
+check("recon-only: no phantom SMB identity line",
+      not re.search(r"(?m)^SMB\s+192\.0\.2\.254", recon), recon)
+
+# a host we actually protocol-scanned (nxc port open) still gets its identity
+# echo — the fix must not over-suppress. nmap_ports present so it clears the
+# "nothing to show" guard, exactly as a real SMB host does.
+scanned = block_text(open_protocols=["smb"], nmap_ports=[(445, "microsoft-ds", "")],
+                     hostname="HOST1", real_ip="192.0.2.50", target="192.0.2.50")
+check("scanned host: identity echo retained", re.search(r"(?m)^SMB\s+192\.0\.2\.50", scanned), scanned)
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)
