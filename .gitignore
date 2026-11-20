@@ -1,0 +1,7 @@
+# loot & output — never commit creds/hashes
+nxc_plus-loot/
+*.log
+*.nmap.xml
+*_bloodhound.zip
+__pycache__/
+*.pyc
