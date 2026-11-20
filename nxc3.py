@@ -110,7 +110,7 @@ PORT_HINTS = {
     161: "SNMP (udp): snmpwalk -v2c -c public {ip}  (try public/private)",
     389: "ldap: nxc ldap {ip}; ldapsearch -x -H ldap://{ip} -s base namingcontexts",
     443: "https: whatweb https://{ip}; gobuster dir -u https://{ip} -k -w common.txt; nikto -h https://{ip}",
-    445: "SMB: nxc smb {ip} --shares; smbclient -L //{ip} -N; enum4linux-ng {ip}; then marksploit",
+    445: "SMB: nxc smb {ip} --shares; smbclient -L //{ip} -N; enum4linux-ng {ip}  (nxc3 auto-enums shares/SAM/LSA on a valid login)",
     1433:"mssql: nxc mssql {ip}; impacket-mssqlclient user:pass@{ip}  (try sa)",
     2049:"NFS: showmount -e {ip}; mount -t nfs {ip}:/<share> /mnt",
     3306:"mysql: mysql -h {ip} -u root  (try no password)",
@@ -120,6 +120,7 @@ PORT_HINTS = {
     5985:"WinRM: nxc winrm {ip}; evil-winrm -i {ip} -u user -p pass",
     6379:"redis: redis-cli -h {ip}  (often unauth)",
     8080:"web-alt: whatweb http://{ip}:8080; gobuster dir -u http://{ip}:8080 -w common.txt",
+    8443:"https-alt: whatweb https://{ip}:8443; nikto -h https://{ip}:8443  (ManageEngine/AppManager etc — check for default creds + CVEs by product/version)",
 }
 
 DEFAULT_WORKERS          = 15
@@ -1070,6 +1071,9 @@ class Nxc3:
             if timed: continue
             lines = [l for l in self._parse_nxc_findings(so)
                      if not set(l) <= set("- ")]      # drop separator rows
+            if label == "shares":                     # drop the column-header row
+                lines = [l for l in lines
+                         if not (l.split()[:1] == ["Share"] and "Permissions" in l)]
             if lines: out.append((label, lines))
         return out
 
