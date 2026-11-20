@@ -823,6 +823,13 @@ class NxcPlus:
         self._current_proto = ""
         self.identity_lock = threading.Lock()
         self._reuse_pivots: list = []
+        self._spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._spin_i = 0
+        self._scan_start = 0.0
+        self._phase = ""                 # what's happening now (module/proto label)
+        self._hb_run = threading.Event()
+        self._hb_pause = False           # silence spinner during spray-delay countdown
+        self._hb_thread: threading.Thread | None = None
         self._nmap_pool = ThreadPoolExecutor(max_workers=max(1, self.target_workers))
 
     def _build_creds(self) -> list[Cred]:
@@ -848,21 +855,58 @@ class NxcPlus:
         return "█" * filled + "░" * (width - filled)
 
     def _redraw(self) -> None:
+        spin = self._spin_frames[self._spin_i % len(self._spin_frames)]
         overall = ""
         if self._scan_total > 1:
             ob = self._bar(self._scan_done, self._scan_total, 20)
             overall = f"{DIM}{ob}{RESET} {self._scan_done}/{self._scan_total} hosts"
         current = ""
+        phase = self._phase or self._current_proto
         if self._total > 0:
             tb = self._bar(self._done, self._total, 15)
-            label = f"  checking {self._current_proto}" if self._current_proto else ""
+            label = f"  {phase}" if phase else ""
             current = (f"  {DIM}│{RESET}  {DIM}{tb} "
                        f"{self._done}/{self._total} protos{label}{RESET}")
-        elif self._current_proto:
-            current = f"  {DIM}│ scanning {self._current_proto}{RESET}"
-        if not overall and not current: return
-        sys.stderr.write(f"\r\033[K  {overall}{current}  ")
+        elif phase:
+            current = f"  {DIM}│{RESET} {phase}"
+        # elapsed timer — when a host takes ages, this keeps climbing so it's
+        # obvious work is still happening and nothing is hung.
+        elapsed = ""
+        if self._scan_start:
+            secs = int(time.time() - self._scan_start)
+            if secs >= 3:
+                elapsed = f"  {DIM}· {secs}s{RESET}"
+        if not overall and not current and not self._hb_run.is_set():
+            return
+        sys.stderr.write(f"\r\033[K  {CYAN}{spin}{RESET} {overall}{current}{elapsed}  ")
         sys.stderr.flush()
+
+    def _heartbeat(self) -> None:
+        """Keep the spinner turning while a host is being worked, even during a
+        long blocking nxc call (SAM/LSA dump, module), so it never looks frozen."""
+        if self.quiet or not sys.stderr.isatty():
+            return
+        while self._hb_run.is_set() and not self._stop.is_set():
+            if not self._hb_pause:
+                with self._progress_lock:
+                    self._spin_i += 1
+                    self._redraw()
+            time.sleep(0.4)
+
+    def _start_heartbeat(self) -> None:
+        if self.quiet or not sys.stderr.isatty() or self._hb_run.is_set():
+            return
+        self._scan_start = time.time()
+        self._hb_run.set()
+        self._hb_thread = threading.Thread(target=self._heartbeat, daemon=True)
+        self._hb_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        self._hb_run.clear()
+        if self._hb_thread:
+            self._hb_thread.join(timeout=1)
+            self._hb_thread = None
+        self._clear_progress()
 
     def _tick(self, n: int = 1) -> None:
         with self._progress_lock:
@@ -1147,6 +1191,9 @@ class NxcPlus:
         out: list[tuple[str, list[str]]] = []
         for label, cmd in checks:
             if self._stop.is_set(): break
+            with self._progress_lock:
+                self._phase = f"enum {ip}: {label}"
+                self._redraw()
             try: so, _, timed = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
             except InterruptedError: break
             if timed: continue
@@ -1205,6 +1252,8 @@ class NxcPlus:
                 out.append((label, lines))
             elif _nxc_errored(so):
                 out.append((label, ["[enumeration error — see raw nxc log]"]))
+        with self._progress_lock:
+            self._phase = ""
         return out
 
     @staticmethod
@@ -1454,12 +1503,14 @@ class NxcPlus:
         orig_creds  = self.creds
         results_map: dict[str, TargetResult] = {}
 
+        self._start_heartbeat()
         for round_idx, cred in enumerate(orig_creds):
             if self._stop.is_set(): break
 
             # Delay between rounds
             if round_idx > 0 and self.spray_delay > 0:
                 preview = (cred.secret[:2] + "***") if cred.secret else "(kerberos)"
+                self._hb_pause = True            # let the countdown own the line
                 for remaining in range(self.spray_delay, 0, -1):
                     if self._stop.is_set(): break
                     sys.stderr.write(
@@ -1468,6 +1519,7 @@ class NxcPlus:
                     sys.stderr.flush()
                     time.sleep(1)
                 sys.stderr.write("\r\033[K"); sys.stderr.flush()
+                self._hb_pause = False
 
             preview = (cred.secret[:2] + "***") if cred.secret else "(kerberos)"
             print_info("[*]", f"round {round_idx+1}/{len(orig_creds)}  —  "
@@ -1504,6 +1556,7 @@ class NxcPlus:
 
             self._clear_progress()
 
+        self._stop_heartbeat()
         self.creds = orig_creds
 
         # Print results
@@ -1581,6 +1634,7 @@ class NxcPlus:
             print()
 
         results: list[TargetResult] = []
+        self._start_heartbeat()
         try:
             target_workers = min(self.target_workers, len(self.targets))
             if target_workers <= 1:
@@ -1646,6 +1700,7 @@ class NxcPlus:
                                 print_info("[!]", f"could not write creds file: {exc}")
                         results.append(r)
         finally:
+            self._stop_heartbeat()
             self._clear_progress()
             if len(results) > 1 and not self._stop.is_set():
                 self._print_summary(results)
@@ -1994,9 +2049,13 @@ class NxcPlus:
         print_info("[*]", f"reusing {len(creds)} looted credential(s) across "
                           f"{len(ips)} host(s) for NEW access")
         pivots, seen_report = [], set()
+        self._start_heartbeat()
         for kind, user, secret, origin in creds:
             if self._stop.is_set():
                 break
+            with self._progress_lock:
+                self._phase = f"reuse: {user}"
+                self._redraw()
             scopes = [["--local-auth"]]
             if domain:
                 scopes.append(["-d", domain])
@@ -2027,6 +2086,7 @@ class NxcPlus:
                     print_info("[+]", f"NEW ACCESS  {hip}  {user} ({sc}) {tag}  "
                                       f"<- looted from {origin}", indent=1)
                     pivots.append((hip, user, sc, admin, origin))
+        self._stop_heartbeat()
         self._reuse_pivots = pivots
         if not pivots:
             print_info("[*]", "no looted credential opened a new box "
