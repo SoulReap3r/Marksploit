@@ -19,6 +19,7 @@ exec(compile(_SRC, _SPEC.origin, "exec"), _G)
 Nxc3           = _G["Nxc3"]
 PORT_HINTS     = _G["PORT_HINTS"]
 PROTOCOL_PORTS = _G["PROTOCOL_PORTS"]
+privilege_label = _G["privilege_label"]
 parse          = Nxc3._parse_nxc_findings
 _ANSI          = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _EMPTY_NT      = "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"
@@ -131,7 +132,21 @@ check("hints: 445/139 suppressed when SMB authed", 445 not in hints and 139 not 
 check("hints: 3389 suppressed when RDP authed", 3389 not in hints, hints)
 check("hints: 8443 (uncracked web) retained", 8443 in hints, hints)
 
-# ══ 7. nmap greppable parse (two-stage -oG line) ═════════════════════════════
+# ══ 7. honest privilege labels (the tool's headline feature) ════════════════
+def lbl(is_guest, is_admin, is_dc, local): return privilege_label(is_guest, is_admin, is_dc, local)[1]
+# admin on DC via DOMAIN cred => Domain Admin (the only case that earns that label)
+check("label: admin+DC+domain => DOMAIN ADMIN", lbl(False, True, True, False) == "[DOMAIN ADMIN — admin on the DC!]")
+# admin on DC but via LOCAL cred is only local admin of the DC, NOT domain admin
+check("label: admin+DC+local => LOCAL ADMIN (not domain)", lbl(False, True, True, True) == "[LOCAL ADMIN — Pwn3d on this host]")
+# admin on a member server (e.g. SECURE .95 with Eric) => local admin, never domain
+check("label: admin on member => LOCAL ADMIN", lbl(False, True, False, False) == "[LOCAL ADMIN — Pwn3d on this host]")
+# plain valid domain user (e.g. Eric on the DC .97) => just a user
+check("label: non-admin domain => valid domain user", lbl(False, False, True, False) == "[valid — domain user]")
+check("label: non-admin local => valid local user", lbl(False, False, False, True) == "[valid — local user]")
+# guest mapping is not real auth and must win over any admin flag
+check("label: guest wins over admin", lbl(True, True, True, False) == "[guest]")
+
+# ══ 8. nmap greppable parse (two-stage -oG line) ═════════════════════════════
 grep_line = ("Host: 192.0.2.95 ()\tPorts: 135/open/tcp//msrpc///, "
              "445/open/tcp//microsoft-ds///, 8443/open/tcp//ssl|https-alt//AppManager/\t")
 parsed = Nxc3._parse_nmap_grep(grep_line)

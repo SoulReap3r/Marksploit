@@ -282,6 +282,23 @@ def q(v: str|None) -> str:
     return shlex.quote(str(v))
 
 
+# ─── Honest privilege label ────────────────────────────────────────────
+def privilege_label(is_guest: bool, is_admin: bool,
+                    is_dc: bool, local_auth: bool) -> tuple[str, str]:
+    """Qualifier shown next to a successful login, kept honest:
+    Pwn3d on a DC with a domain cred ~ Domain Admin; Pwn3d on a member = Local
+    Admin of that host; a guest mapping is not real auth; else a plain valid user.
+    Returns (ansi_color_prefix, bracket_text)."""
+    if is_guest:
+        return (YELLOW, "[guest]")
+    if is_admin and is_dc and not local_auth:
+        return (RED + BOLD, "[DOMAIN ADMIN — admin on the DC!]")
+    if is_admin:
+        return (GREEN + BOLD, "[LOCAL ADMIN — Pwn3d on this host]")
+    who = "local user" if local_auth else "domain user"
+    return (GREEN, f"[valid — {who}]")
+
+
 # ─── Suggested commands ────────────────────────────────────────────────
 def build_suggestions(s: Success, ip: str, hostname: str,
                       is_dc: bool, extra_hash: str|None) -> list[tuple[str,str]]:
@@ -565,17 +582,9 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
             scope = "local" if s.local_auth else "domain"
             auth  = s.auth_type.value if s.auth_type != AuthType.PASSWORD else "password"
             tag   = f"{s.protocol.upper()}/{scope}/{auth}"
-            # Distinguish privilege honestly: Pwn3d on a DC ~ Domain Admin; Pwn3d
-            # on a member = Local Admin of that box; otherwise it's just a user.
-            if   s.is_guest:
-                qual = f"  {YELLOW}[guest]{RESET}"
-            elif s.is_admin and result.is_dc and not s.local_auth:
-                qual = f"  {RED}{BOLD}[DOMAIN ADMIN — admin on the DC!]{RESET}"
-            elif s.is_admin:
-                qual = f"  {GREEN}{BOLD}[LOCAL ADMIN — Pwn3d on this host]{RESET}"
-            else:
-                who = "local user" if s.local_auth else "domain user"
-                qual = f"  {GREEN}[valid — {who}]{RESET}"
+            col, label = privilege_label(s.is_guest, s.is_admin,
+                                         result.is_dc, s.local_auth)
+            qual = f"  {col}{label}{RESET}"
             iprint("[+]", f"{s.raw_message}   [{tag}]{qual}")
         print(flush=True)
 
