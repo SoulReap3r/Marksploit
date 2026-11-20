@@ -511,10 +511,17 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
             line = f"      {GREEN}{port:>5}/tcp{RESET}  {svc:<12}"
             if ver: line += f"  {DIM}{ver}{RESET}"
             print(line, flush=True)
-        # next steps for the ports we recognise
-        hints = [(p, PORT_HINTS[p]) for p, _, _ in result.nmap_ports if p in PORT_HINTS]
+        # next steps for the ports we recognise — but skip the generic recon hint
+        # for any protocol we already authenticated to (the [PROTO] suggested
+        # block + credentialed enum below already cover those, in depth).
+        authed_ports = {PROTOCOL_PORTS[s.protocol] for s in result.successes
+                        if s.protocol in PROTOCOL_PORTS}
+        if any(s.protocol == "smb" for s in result.successes):
+            authed_ports |= {139, 445}
+        hints = [(p, PORT_HINTS[p]) for p, _, _ in result.nmap_ports
+                 if p in PORT_HINTS and p not in authed_ports]
         if hints:
-            print(f"\n  {CYAN}[*]{RESET} next steps", flush=True)
+            print(f"\n  {CYAN}[*]{RESET} next steps  {DIM}(ports not yet cracked){RESET}", flush=True)
             for port, hint in hints:
                 print(f"      {ORANGE}# {port}{RESET}  {hint.replace('{ip}', ip)}", flush=True)
         print(flush=True)
