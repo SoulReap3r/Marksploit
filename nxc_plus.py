@@ -545,11 +545,12 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
         return
 
     print(f"\n\n{_SEP}", flush=True)
-    print(flush=True)
 
     if result.target_info:
         dc_flag = " [DC]" if result.is_dc else ""
         print_cme("SMB", ip, 445, host, "[*]", result.target_info + dc_flag)
+        print(_SEP, flush=True)          # rule under the banner — boxes the host
+    print(flush=True)
 
     # ── nmap service scan + per-port next steps ────────────────────────
     if result.nmap_ports:
