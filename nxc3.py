@@ -30,6 +30,29 @@ from typing import Iterable
 # ─── Tee — mirror stdout to file ───────────────────────────────────────
 _ANSI_RE = re.compile(r"\033\[[0-9;]*[mABCDEFGHJKSTfnsulh]")
 
+# NetExec sometimes spews a multi-line Rich traceback / error (broken pipe,
+# access-denied mid-enum, unsupported op). Those lines have no nxc prefix and
+# no [*]/[-]/[+] marker, so _parse_nxc_findings lets them through — which once
+# made a failed --shares render as "shares (106)" of traceback. Treat them as
+# noise. Real share/SAM/LSA/GPP result lines never contain these tokens.
+_NXC_NOISE_RE = re.compile(
+    r"[│╭╮╰╯├┤❱┌┐└┘┄┈]"                     # rich traceback frame / box drawing
+    r"|Traceback \(most recent call last\)"
+    r"|\[Errno \d+\]"                          # OSError text
+    r"|Broken pipe"
+    r"|\b\w+\.py:\d+\b"                         # python source ref (connection.py:187)
+    r"|^\[\d\d:\d\d:\d\d\]\s+(?:ERROR|CRITICAL)"  # nxc timestamped error line
+    r"|^(?:ERROR|CRITICAL)\b"
+)
+def _is_nxc_noise(line: str) -> bool:
+    return bool(_NXC_NOISE_RE.search(line))
+
+def _nxc_errored(stdout: str) -> bool:
+    """True when nxc emitted a hard error/traceback (not just a [-] miss)."""
+    s = _ANSI_RE.sub("", stdout)
+    return ("Traceback (most recent call last)" in s or "[Errno" in s
+            or re.search(r"\]\s+(?:ERROR|CRITICAL)\b", s) is not None)
+
 
 class Tee:
     """Mirror sys.stdout to a file with ANSI codes stripped."""
@@ -1105,7 +1128,8 @@ class Nxc3:
             except InterruptedError: break
             if timed: continue
             lines = [l for l in self._parse_nxc_findings(so)
-                     if not set(l) <= set("- ")]      # drop separator rows
+                     if not set(l) <= set("- ")        # drop separator rows
+                     and not _is_nxc_noise(l)]         # drop traceback/error noise
             if label == "shares":                     # drop the column-header row
                 lines = [l for l in lines
                          if not (l.split()[:1] == ["Share"] and "Permissions" in l)]
@@ -1118,7 +1142,12 @@ class Nxc3:
                          if re.search(r"(?i)\b(?:user(?:name)?s?|pass(?:word)?s?|"
                                       r"cpassword|credential|accountname|runas|"
                                       r"domains?)\b", l)]
-            if lines: out.append((label, lines))
+            if lines:
+                out.append((label, lines))
+            elif _nxc_errored(so):
+                # command hard-errored and left no clean data — say so honestly
+                # instead of silently dropping it or dumping the traceback.
+                out.append((label, ["[enumeration error — see raw nxc log]"]))
         return out
 
     # ── one target ─────────────────────────────────────────────────────

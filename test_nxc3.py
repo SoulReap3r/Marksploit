@@ -178,5 +178,36 @@ scanned = block_text(open_protocols=["smb"], nmap_ports=[(445, "microsoft-ds", "
                      hostname="HOST1", real_ip="192.0.2.50", target="192.0.2.50")
 check("scanned host: identity echo retained", re.search(r"(?m)^SMB\s+192\.0\.2\.50", scanned), scanned)
 
+# ══ 10. credentialed-enum must not render an nxc traceback as "shares" ═══════
+# A failed --shares (broken pipe / access-denied mid-enum) makes nxc emit a Rich
+# traceback with no prefix and no [*]/[-]/[+] marker — which once rendered as
+# "shares (106)" of garbage. The noise filter must drop it; clean shares survive.
+_is_nxc_noise = _G["_is_nxc_noise"]
+_nxc_errored  = _G["_nxc_errored"]
+def cred_shares_filter(stdout):
+    lines = [l for l in parse(stdout)
+             if not set(l) <= set("- ") and not _is_nxc_noise(l)]
+    return [l for l in lines
+            if not (l.split()[:1] == ["Share"] and "Permissions" in l)]
+
+shares_err = """SMB  192.0.2.97  445  HOST  [06:29:26] ERROR    Exception while calling proto_flow()   connection.py:187
+SMB  192.0.2.97  445  HOST  target 192.0.2.97: [Errno 32] Broken pipe
+SMB  192.0.2.97  445  HOST  ╭── Traceback (most recent call last) ───╮
+SMB  192.0.2.97  445  HOST  │ /usr/lib/python3/dist-packages/nxc/connection.py:177 │
+SMB  192.0.2.97  445  HOST  │   177 │   self.proto_flow()                           │
+SMB  192.0.2.97  445  HOST  ╰─────────────────────────────────────────────────────╯"""
+check("cred-enum: nxc traceback filtered to nothing", cred_shares_filter(shares_err) == [],
+      cred_shares_filter(shares_err))
+check("cred-enum: hard error is detected (-> honest note, not silence)", _nxc_errored(shares_err))
+
+good_shares = """SMB 192.0.2.97 445 HOST Share           Permissions     Remark
+SMB 192.0.2.97 445 HOST -----           -----------     ------
+SMB 192.0.2.97 445 HOST ADMIN$                          Remote Admin
+SMB 192.0.2.97 445 HOST C$                              Default share
+SMB 192.0.2.97 445 HOST IPC$            READ            Remote IPC"""
+gs = cred_shares_filter(good_shares)
+check("cred-enum: clean shares survive the noise filter (no false positives)",
+      len(gs) == 3 and not _nxc_errored(good_shares), gs)
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)
