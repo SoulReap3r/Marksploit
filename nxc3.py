@@ -1689,9 +1689,20 @@ class Nxc3:
             tips.append(("unconstrained delegation present — coerce auth then capture the TGT",
                          "impacket-ntlmrelayx / PetitPotam / printerbug against the delegated host"))
         if has("adminCount=1 (protected)"):
-            names = ", ".join(found["adminCount=1 (protected)"][:8])
-            tips.append((f"high-value targets (adminCount=1): {names}",
-                         "focus password-spray / kerberoast / cred-hunting on these"))
+            # Built-ins are always adminCount=1 and are NOT useful targets; the
+            # custom names are the real privesc goals (DA / protected-group members).
+            BUILTIN = {"administrator", "krbtgt", "guest", "defaultaccount"}
+            allnames = found["adminCount=1 (protected)"]
+            targets  = [n for n in allnames if n.split()[0].lower() not in BUILTIN]
+            if targets:
+                tips.append((f"PRIME TARGETS — privileged non-default accounts "
+                             f"(adminCount=1): {', '.join(targets[:8])}",
+                             "these are Domain Admins / protected-group members — owning "
+                             "any one = likely domain compromise. Get their creds: password "
+                             "spray, kerberoast, cred reuse from looted hosts, or AS-REP"))
+            else:
+                tips.append((f"adminCount=1 (only built-ins): {', '.join(allnames[:8])}",
+                             "no custom privileged users surfaced — pivot via delegation/MAQ instead"))
         if not tips:
             return
         print()
