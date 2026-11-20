@@ -598,7 +598,13 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
                     seen_info.add(info_key)
                     iprint("[*]", f"{proto.upper()} {msg}" + sn)
 
-    if result.anon_smb:
+    if result.anon_smb and result.successes:
+        # Already authenticated — null session is a notable finding, not a
+        # to-do list (we've enumerated with real creds already).
+        iprint("[!]", "null session also allowed (anonymous SMB) — "
+                      "unauth users can enumerate this host", )
+        print(flush=True)
+    elif result.anon_smb:
         iprint("[*]", "anonymous SMB — next steps")
         print(flush=True)
         for label, cmd in [
