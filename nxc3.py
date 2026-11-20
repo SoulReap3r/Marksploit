@@ -134,16 +134,21 @@ PORT_HINTS = {
     389: "ldap: nxc ldap {ip}; ldapsearch -x -H ldap://{ip} -s base namingcontexts",
     443: "https: whatweb https://{ip}; gobuster dir -u https://{ip} -k -w common.txt; nikto -h https://{ip}",
     445: "SMB: nxc smb {ip} --shares; smbclient -L //{ip} -N; enum4linux-ng {ip}  (nxc3 auto-enums shares/SAM/LSA on a valid login)",
+    873: "rsync: rsync -av --list-only rsync://{ip}/  (list modules, often anon-readable); then pull a module's files",
     1433:"mssql: nxc mssql {ip}; impacket-mssqlclient user:pass@{ip}  (try sa)",
+    1521:"oracle TNS: odat sidguesser -s {ip}; odat all -s {ip}  (SID brute then creds)",
     2049:"NFS: showmount -e {ip}; mount -t nfs {ip}:/<share> /mnt",
     3306:"mysql: mysql -h {ip} -u root  (try no password)",
     3389:"RDP: nxc rdp {ip}; xfreerdp3 /v:{ip} /u:user /p:pass /cert:ignore",
     5432:"postgres: psql -h {ip} -U postgres",
     5900:"VNC: vncviewer {ip}  (often no/weak auth)",
     5985:"WinRM: nxc winrm {ip}; evil-winrm -i {ip} -u user -p pass",
-    6379:"redis: redis-cli -h {ip}  (often unauth)",
-    8080:"web-alt: whatweb http://{ip}:8080; gobuster dir -u http://{ip}:8080 -w common.txt",
+    5986:"WinRM/TLS: nxc winrm {ip}; evil-winrm -i {ip} -u user -p pass -S  (ignore cert)",
+    6379:"redis: redis-cli -h {ip}  (often unauth); try CONFIG GET dir / module load",
+    8080:"web-alt: whatweb http://{ip}:8080; gobuster dir -u http://{ip}:8080 -w common.txt  (Tomcat? /manager, default creds)",
     8443:"https-alt: whatweb https://{ip}:8443; nikto -h https://{ip}:8443  (ManageEngine/AppManager etc — check for default creds + CVEs by product/version)",
+    11211:"memcached: nc {ip} 11211 then 'stats'/'version'; memcdump --servers={ip}  (unauth data)",
+    27017:"mongodb: mongosh mongodb://{ip}  (often no auth); show dbs",
 }
 
 DEFAULT_WORKERS          = 15

@@ -228,5 +228,12 @@ ac = [h for h in parse(admincount) if not _is_nxc_noise(h)]
 check("enrichment: clean admin-count names survive the filter",
       ac == ["Administrator", "svcadmin", "helpdesk"] and not _nxc_errored(admincount), ac)
 
+# ══ 12. PORT_HINTS covers the common OSCP/PG services (recon completeness) ════
+for p, kw in [(873, "rsync"), (1521, "oracle"), (5986, "winrm"),
+              (11211, "memcached"), (27017, "mongo")]:
+    check(f"PORT_HINTS has {p} ({kw})",
+          p in PORT_HINTS and kw in PORT_HINTS[p].lower() and "{ip}" in PORT_HINTS[p],
+          PORT_HINTS.get(p))
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)
