@@ -122,9 +122,9 @@ PORT_HINTS = {
     22:  "ssh — grab banner; brute only if you have a userlist: hydra -L u -P p ssh://{ip}",
     23:  "telnet {ip} — cleartext, grab banner",
     25:  "smtp user enum: smtp-user-enum -M VRFY -U users.txt -t {ip}",
-    53:  "DNS — try zone transfer: dig axfr @{ip} <domain>",
+    53:  "DNS — try zone transfer: dig axfr @{ip} {domain}",
     80:  "web: whatweb http://{ip}; gobuster dir -u http://{ip} -w dirb/common.txt; nikto -h http://{ip}",
-    88:  "KERBEROS = Domain Controller. kerbrute userenum --dc {ip} -d <domain> names.txt; AS-REP roast",
+    88:  "KERBEROS = Domain Controller. kerbrute userenum --dc {ip} -d {domain} names.txt; AS-REP roast",
     110: "pop3 — nc {ip} 110, try creds",
     111: "rpcbind/NFS: rpcinfo {ip}; showmount -e {ip}",
     135: "msrpc: impacket-rpcdump {ip} | grep -i ncacn",
@@ -135,15 +135,15 @@ PORT_HINTS = {
     443: "https: whatweb https://{ip}; gobuster dir -u https://{ip} -k -w common.txt; nikto -h https://{ip}",
     445: "SMB: nxc smb {ip} --shares; smbclient -L //{ip} -N; enum4linux-ng {ip}  (nxc3 auto-enums shares/SAM/LSA on a valid login)",
     873: "rsync: rsync -av --list-only rsync://{ip}/  (list modules, often anon-readable); then pull a module's files",
-    1433:"mssql: nxc mssql {ip}; impacket-mssqlclient user:pass@{ip}  (try sa)",
+    1433:"mssql: nxc mssql {ip}; impacket-mssqlclient {user}:{pass}@{ip}  (try sa)",
     1521:"oracle TNS: odat sidguesser -s {ip}; odat all -s {ip}  (SID brute then creds)",
     2049:"NFS: showmount -e {ip}; mount -t nfs {ip}:/<share> /mnt",
     3306:"mysql: mysql -h {ip} -u root  (try no password)",
-    3389:"RDP: nxc rdp {ip}; xfreerdp3 /v:{ip} /u:user /p:pass /cert:ignore",
+    3389:"RDP: nxc rdp {ip}; xfreerdp3 /v:{ip} /u:{user} /p:{pass} /cert:ignore",
     5432:"postgres: psql -h {ip} -U postgres",
     5900:"VNC: vncviewer {ip}  (often no/weak auth)",
-    5985:"WinRM: nxc winrm {ip}; evil-winrm -i {ip} -u user -p pass",
-    5986:"WinRM/TLS: nxc winrm {ip}; evil-winrm -i {ip} -u user -p pass -S  (ignore cert)",
+    5985:"WinRM: nxc winrm {ip}; evil-winrm -i {ip} -u {user} -p {pass}",
+    5986:"WinRM/TLS: nxc winrm {ip}; evil-winrm -i {ip} -u {user} -p {pass} -S  (ignore cert)",
     6379:"redis: redis-cli -h {ip}  (often unauth); try CONFIG GET dir / module load",
     8080:"web-alt: whatweb http://{ip}:8080; gobuster dir -u http://{ip}:8080 -w common.txt  (Tomcat? /manager, default creds)",
     8443:"https-alt: whatweb https://{ip}:8443; nikto -h https://{ip}:8443  (ManageEngine/AppManager etc — check for default creds + CVEs by product/version)",
@@ -239,7 +239,8 @@ def print_info(marker: str, msg: str, indent: int = 0) -> None:
     body  = f"{'  '*indent}{marker} {hl_comment(msg, color)}"
     print(f"{color}{body}{RESET}" if color else body, flush=True)
 
-_SEP = f"{DIM}{'─'*64}{RESET}"
+_SEP_W = min(max(shutil.get_terminal_size((100, 24)).columns, 64), 140)
+_SEP = f"{DIM}{'─'*_SEP_W}{RESET}"
 
 
 # ─── nxc output parsing ────────────────────────────────────────────────
@@ -571,9 +572,18 @@ def print_target_block(result: TargetResult, extra_hash: str|None,
         hints = [(p, PORT_HINTS[p]) for p, _, _ in result.nmap_ports
                  if p in PORT_HINTS and p not in authed_ports]
         if hints:
+            # fill in domain/user/pass from what we actually have, so the
+            # commands are copy-paste ready instead of showing placeholders
+            win = next((s for s in result.successes if not s.is_guest), None)
+            dom = result.domain or "<domain>"
+            usr = (win.user if win else "") or "<user>"
+            pw  = (win.secret if (win and not win.is_hash) else "") or "<pass>"
+            def fill(h: str) -> str:
+                return (h.replace("{ip}", ip).replace("{domain}", dom)
+                         .replace("{user}", usr).replace("{pass}", pw))
             print(f"\n  {CYAN}[*]{RESET} next steps  {DIM}(ports not yet cracked){RESET}", flush=True)
             for port, hint in hints:
-                print(f"      {ORANGE}# {port}{RESET}  {hint.replace('{ip}', ip)}", flush=True)
+                print(f"      {ORANGE}# {port}{RESET}  {fill(hint)}", flush=True)
         print(flush=True)
 
     # ── notable config flags (worth investigating — NOT auto-vulns) ─────
