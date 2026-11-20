@@ -1782,6 +1782,12 @@ class NxcPlus:
     def _print_summary(self, results: list[TargetResult]) -> None:
         self._clear_progress()
         n_win = sum(1 for r in results if r.successes or r.anon_smb)
+        # ── FIN banner — clear divider between scan output and the summary/next-steps ──
+        bar = "━" * _SEP_W
+        print("\n")
+        print(f"{BOLD}{CYAN}{bar}{RESET}")
+        print(f"{BOLD}{CYAN}  ■ FIN — END OF SCANS  │  SUMMARY & NEXT STEPS BELOW ▼{RESET}")
+        print(f"{BOLD}{CYAN}{bar}{RESET}")
         print()
         print_info("[*]", f"scan complete  —  {n_win}/{len(results)} targets with credentials")
         for r in results:
